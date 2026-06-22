@@ -12,6 +12,7 @@ multi-app natural language requests from the user by:
 
 Usage:
     python main.py "Set up PostgreSQL and then connect it to pgAdmin"
+    python main.py                      # will prompt you to enter the app(s) interactively
 """
 
 import os
@@ -226,8 +227,20 @@ def run_multi_app_agent(user_request: str, force_restart: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Phase 6 Main Agent Orchestrator")
-    parser.add_argument("request", type=str, nargs="?", default="Set up PostgreSQL and pgAdmin", help="Natural language request of what to set up.")
+    parser.add_argument("request", type=str, nargs="?", default=None, help="Natural language request of what to set up.")
     parser.add_argument("--force", action="store_true", help="Force restart, ignoring saved progress.")
     args = parser.parse_args()
-    
-    run_multi_app_agent(args.request, force_restart=args.force)
+
+    # If no request was passed on the command line, ask the user interactively
+    user_request = args.request
+    if not user_request:
+        print("=" * 60)
+        print("  🌐 AI Setup Agent")
+        print("=" * 60)
+        while True:
+            user_request = input("\nEnter the application/software you want to set up: ").strip()
+            if user_request:
+                break
+            print("⚠️  Please enter a valid application/software name.")
+
+    run_multi_app_agent(user_request, force_restart=args.force)
