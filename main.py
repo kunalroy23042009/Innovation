@@ -21,30 +21,25 @@ import json
 import argparse
 from datetime import datetime
 
+from config import config
+from logger import logger, log_step
+
 try:
     import ollama
 except ImportError:
     raise ImportError("The 'ollama' package is required.")
 
-# Import our LangGraph orchestrator from Phase 4
 try:
     import agent_graph
 except ImportError:
     agent_graph = None
-    print("[WARN] agent_graph.py not found. Using mocked execution.")
+    logger.warning("agent_graph.py not found. Using mocked execution.")
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
 
-PROGRESS_FILE = "agent_progress.json"
-PLANNER_MODEL = "llama3"
+class SetupOrchestrator:
+    """Orchestrates multi-app setup tasks."""
 
-# ===========================================================================
-# Helper: Task Planning via Ollama
-# ===========================================================================
-
-PLANNER_PROMPT = """You are the master task planner for an AI Setup Agent.
+    PLANNER_PROMPT = """You are the master task planner for an AI Setup Agent.
 The user wants to set up one or more software applications.
 Your job is to break their request down into a sequential list of sub-tasks.
 Each sub-task must focus on a SINGLE application.
@@ -65,182 +60,186 @@ Example:
 Respond with ONLY valid JSON.
 """
 
-def generate_task_plan(user_request: str) -> list[dict]:
-    """Uses Ollama to break a user request into sequential app sub-tasks."""
-    print("🧠 Planning tasks with Ollama...")
-    prompt = PLANNER_PROMPT.format(user_request=user_request)
-    
-    try:
-        response = ollama.chat(
-            model=PLANNER_MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        raw = response.message.content.strip()
-        
-        # Cleanup potential markdown fences
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
-            
-        tasks = json.loads(raw)
-        
-        if not isinstance(tasks, list):
-            raise ValueError("Planner did not return a JSON array.")
-            
-        return tasks
-    except Exception as e:
-        print(f"❌ Failed to generate task plan: {e}")
-        # Fallback to a single generic task if parsing fails
-        return [{"app_name": user_request, "intent": "setup", "context_needed": ""}]
+    def __init__(self, force_restart: bool = False):
+        self.force_restart = force_restart
+        self.state: dict = {}
 
-# ===========================================================================
-# Helper: Progress Tracking (Save/Load State)
-# ===========================================================================
+    def generate_task_plan(self, user_request: str) -> list[dict]:
+        """Uses Ollama to break a user request into sequential app sub-tasks."""
+        log_step("🧠", "Planning tasks with Ollama...")
+        prompt = self.PLANNER_PROMPT.format(user_request=user_request)
 
-def load_progress() -> dict:
-    """Loads saved progress from disk to allow resuming."""
-    if os.path.exists(PROGRESS_FILE):
         try:
-            with open(PROGRESS_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            pass
-    return {}
+            response = ollama.chat(
+                model=config.planner_model,
+                messages=[{"role": "user", "content": prompt}],
+            )
 
-def save_progress(state: dict):
-    """Saves the current multi-app state to disk."""
-    with open(PROGRESS_FILE, "w") as f:
-        json.dump(state, f, indent=4)
+            raw = response.message.content.strip()
 
-def clear_progress():
-    """Removes the progress file after a successful full run."""
-    if os.path.exists(PROGRESS_FILE):
-        os.remove(PROGRESS_FILE)
+            # Cleanup potential markdown fences
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
 
-# ===========================================================================
-# Main Orchestrator
-# ===========================================================================
+            tasks = json.loads(raw)
 
-def run_multi_app_agent(user_request: str, force_restart: bool = False):
-    """
-    The top-level loop that processes the user request, generates the task list,
-    and runs the LangGraph agent for each app in sequence.
-    """
-    print("=" * 60)
-    print("  🌐 AI Setup Agent — Main Orchestrator")
-    print(f"  Request: '{user_request}'")
-    print("=" * 60)
+            if not isinstance(tasks, list):
+                raise ValueError("Planner did not return a JSON array.")
 
-    # 1. Load or Initialize State
-    state = load_progress()
-    
-    if state and not force_restart:
-        print(f"📥 Found existing progress from {state.get('last_updated', 'unknown')}.")
-        resume = input("Do you want to resume? (y/n): ").strip().lower()
-        if resume != 'y':
-            state = {}
-            print("🔄 Starting fresh...")
-    else:
-        state = {}
-
-    if not state:
-        # 2. Plan Tasks
-        tasks = generate_task_plan(user_request)
-        state = {
-            "original_request": user_request,
-            "tasks": tasks,
-            "current_index": 0,
-            "global_context": {},  # Stores shared data between apps
-            "results": [],
-            "last_updated": datetime.now().isoformat()
-        }
-        save_progress(state)
-
-    tasks = state["tasks"]
-    current_index = state["current_index"]
-    
-    print("\n📋 Task Plan:")
-    for i, t in enumerate(tasks):
-        status = "[DONE]" if i < current_index else "[PENDING]" if i > current_index else "[ACTIVE]"
-        print(f"  {i+1}. {status} App: {t['app_name']} | Intent: {t['intent']}")
-    print("-" * 60)
-
-    # 3. Execute Sub-tasks
-    while current_index < len(tasks):
-        task = tasks[current_index]
-        app_name = task["app_name"]
-        
-        print(f"\n🚀 Starting Task {current_index + 1}/{len(tasks)}: {app_name}")
-        print(f"   Context available: {state['global_context']}")
-        
-        # In a fully integrated system, we would pass task['intent'] and state['global_context']
-        # into agent_graph.run_setup_agent as initial inputs.
-        
-        success = False
-        try:
-            if agent_graph:
-                # Call the Phase 4 LangGraph agent
-                agent_graph.run_setup_agent(app_name=app_name)
-                # If it finishes without raising an exception, we consider it a success for now.
-                success = True
-            else:
-                print(f"[MOCK] Running setup for {app_name}...")
-                success = True
-                
+            return tasks
         except Exception as e:
-            print(f"\n❌ Task {app_name} failed: {e}")
+            logger.error(f"Failed to generate task plan: {e}")
+            # Fallback to a single generic task if parsing fails
+            return [
+                {"app_name": user_request, "intent": "setup", "context_needed": ""}
+            ]
+
+    def load_progress(self) -> dict:
+        """Loads saved progress from disk to allow resuming."""
+        if os.path.exists(config.progress_file):
+            try:
+                with open(config.progress_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                logger.warning("Corrupted progress file. Starting fresh.")
+                pass
+        return {}
+
+    def save_progress(self) -> None:
+        """Saves the current multi-app state to disk."""
+        with open(config.progress_file, "w", encoding="utf-8") as f:
+            json.dump(self.state, f, indent=4)
+
+    def clear_progress(self) -> None:
+        """Removes the progress file after a successful full run."""
+        if os.path.exists(config.progress_file):
+            os.remove(config.progress_file)
+
+    def initialize_state(self, user_request: str) -> None:
+        """Loads existing state or initializes a new one based on user request."""
+        self.state = self.load_progress()
+
+        if self.state and not self.force_restart:
+            last_updated = self.state.get("last_updated", "unknown")
+            log_step("📥", f"Found existing progress from {last_updated}.")
+            resume = input("Do you want to resume? (y/n): ").strip().lower()
+            if resume != "y":
+                self.state = {}
+                log_step("🔄", "Starting fresh...")
+
+        if not self.state:
+            tasks = self.generate_task_plan(user_request)
+            self.state = {
+                "original_request": user_request,
+                "tasks": tasks,
+                "current_index": 0,
+                "global_context": {},  # Stores shared data between apps
+                "results": [],
+                "last_updated": datetime.now().isoformat(),
+            }
+            self.save_progress()
+
+    def run(self, user_request: str) -> None:
+        """Executes the setup process."""
+        print("=" * 60)
+        print("  🌐 AI Setup Agent — Main Orchestrator")
+        print(f"  Request: '{user_request}'")
+        print("=" * 60)
+
+        self.initialize_state(user_request)
+
+        tasks = self.state["tasks"]
+        current_index = self.state["current_index"]
+
+        print("\n📋 Task Plan:")
+        for i, t in enumerate(tasks):
+            if i < current_index:
+                status = "[DONE]"
+            elif i > current_index:
+                status = "[PENDING]"
+            else:
+                status = "[ACTIVE]"
+            print(f"  {i+1}. {status} App: {t['app_name']} | Intent: {t['intent']}")
+        print("-" * 60)
+
+        while current_index < len(tasks):
+            task = tasks[current_index]
+            app_name = task["app_name"]
+
+            print(f"\n🚀 Starting Task {current_index + 1}/{len(tasks)}: {app_name}")
+            print(f"   Context available: {self.state['global_context']}")
+
             success = False
+            try:
+                if agent_graph:
+                    # In a fully integrated system, pass task['intent'] & context
+                    agent_graph.run_setup_agent(app_name=app_name)
+                    success = True
+                else:
+                    log_step("MOCK", f"Running setup for {app_name}...")
+                    success = True
+            except Exception as e:
+                logger.error(f"Task {app_name} failed: {e}")
+                success = False
 
-        # 4. Save Task Results & Update Context
-        if success:
-            print(f"\n✅ Task {app_name} completed successfully.")
-            state["results"].append({"app_name": app_name, "status": "success"})
-            
-            # Simulated context extraction: In reality, we'd extract credentials/paths 
-            # from the AgentGraph's final state and store them here.
-            state["global_context"][f"{app_name}_status"] = "installed"
-            
-            state["current_index"] += 1
-            state["last_updated"] = datetime.now().isoformat()
-            save_progress(state)
-            current_index += 1
-        else:
-            state["results"].append({"app_name": app_name, "status": "failed"})
-            state["last_updated"] = datetime.now().isoformat()
-            save_progress(state)
-            print(f"\n🛑 Halting execution due to failure in {app_name}.")
-            print("You can rerun this script later to resume from this point.")
-            sys.exit(1)
+            if success:
+                log_step("✅", f"Task {app_name} completed successfully.")
+                self.state["results"].append(
+                    {"app_name": app_name, "status": "success"}
+                )
+                self.state["global_context"][f"{app_name}_status"] = "installed"
+                self.state["current_index"] += 1
+                self.state["last_updated"] = datetime.now().isoformat()
+                self.save_progress()
+                current_index += 1
+            else:
+                self.state["results"].append({"app_name": app_name, "status": "failed"})
+                self.state["last_updated"] = datetime.now().isoformat()
+                self.save_progress()
+                log_step("🛑", f"Halting execution due to failure in {app_name}.")
+                logger.info("You can rerun this script later to resume from this point.")
+                sys.exit(1)
 
-    # 5. Final Summary
-    print("\n" + "=" * 60)
-    print("  🎉 ALL TASKS COMPLETED SUCCESSFULLY")
-    print("=" * 60)
-    for r in state["results"]:
-        icon = "✅" if r["status"] == "success" else "❌"
-        print(f"  {icon} {r['app_name']}")
-    print("\nCleaning up progress file...")
-    clear_progress()
-    print("Done!")
+        print("\n" + "=" * 60)
+        print("  🎉 ALL TASKS COMPLETED SUCCESSFULLY")
+        print("=" * 60)
+        for r in self.state["results"]:
+            icon = "✅" if r["status"] == "success" else "❌"
+            print(f"  {icon} {r['app_name']}")
+        
+        log_step("🧹", "Cleaning up progress file...")
+        self.clear_progress()
+        print("Done!")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Phase 6 Main Agent Orchestrator")
-    parser.add_argument("request", type=str, nargs="?", default=None, help="Natural language request of what to set up.")
-    parser.add_argument("--force", action="store_true", help="Force restart, ignoring saved progress.")
+    parser = argparse.ArgumentParser(
+        description="Run the Phase 6 Main Agent Orchestrator"
+    )
+    parser.add_argument(
+        "request",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Natural language request of what to set up.",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Force restart, ignoring saved progress."
+    )
     args = parser.parse_args()
 
-    # If no request was passed on the command line, ask the user interactively
-    user_request = args.request
-    if not user_request:
+    request = args.request
+    if not request:
         print("=" * 60)
         print("  🌐 AI Setup Agent")
         print("=" * 60)
         while True:
-            user_request = input("\nEnter the application/software you want to set up: ").strip()
-            if user_request:
+            request = input("\nEnter the application/software you want to set up: ").strip()
+            if request:
                 break
             print("⚠️  Please enter a valid application/software name.")
 
-    run_multi_app_agent(user_request, force_restart=args.force)
+    orchestrator = SetupOrchestrator(force_restart=args.force)
+    orchestrator.run(request)

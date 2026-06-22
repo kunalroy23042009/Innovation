@@ -1,0 +1,31 @@
+{
+    "original_request": "figma",
+    "tasks": [
+        {
+            "app_name": "Figma",
+            "intent": "download installer",
+            "context_needed": ""
+        },
+        {
+            "app_name": "Figma",
+            "intent": "run installer",
+            "context_needed": ""
+        },
+        {
+            "app_name": "Figma",
+            "intent": "launch and set up account",
+            "context_needed": ""
+        }
+    ],
+    "current_index": 1,
+    "global_context": {
+        "Figma_status": "installed"
+    },
+    "results": [
+        {
+            "app_name": "Figma",
+            "status": "success"
+        }
+    ],
+    "last_updated": "2026-06-22T20:08:02.410822"
+}
