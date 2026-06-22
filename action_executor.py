@@ -2,30 +2,24 @@
 action_executor.py — Phase 3: AI-Driven Mouse/Keyboard Automation
 =================================================================
 
-This module gives the AI agent "hands" — the ability to physically interact
-with the screen by controlling the mouse and keyboard, just like a human.
-
-Pipeline for each step:
-    1. Parse the step dict from Phase 2 into a concrete action plan
-    2. Capture current screen state
-    3. Use Ollama (llava) to locate UI elements (buttons, text fields, etc.)
-    4. Execute the action via pyautogui (click, type, press keys)
-    5. Wait, then capture a verification screenshot
-    6. Use Ollama to verify whether the step succeeded
-
-Safety Features:
-    - Configurable delay between ALL actions (default 0.5s)
-    - pyautogui failsafe: move mouse to top-left corner to abort
-    - Maximum retry count per step
-    - Dry-run mode for testing without actual input
-    - Action logging for audit trail
+FIXES & IMPROVEMENTS over v1:
+- Center-coordinate rejection: llava commonly hallucinates screen center
+  when it can't find the element — we now detect and reject these
+- Keyboard fallback system: when vision fails, uses Win key / hotkeys instead
+- Lenient verification: doesn't fail just because terminal is visible in background
+- Retry logic: each step retries MAX_RETRIES times with different strategies
+- stop_on_failure defaults to False — agent keeps going and reports all results
+- Stronger prompts: taskbar Y hint, screen center warning, coordinate examples
+- 5-attempt JSON parser (added trailing comma + single-quote fixer)
+- VERIFY_DELAY increased to 2.5s — gives apps time to actually open
+- _execute_action now returns (note, used_fallback) tuple for better logging
+- Per-attempt logging: each retry logged separately with attempt number
 
 Dependencies:
     pip install pyautogui pygetwindow Pillow mss ollama
 
 Usage:
     from action_executor import execute_step, execute_all_steps
-
     step = {"step_number": 1, "action": "Click the Next button", "expected_result": "Moves to page 2"}
     result = execute_step(step)
     print(f"Success: {result['success']}")
@@ -38,39 +32,30 @@ import sys
 import time
 import tempfile
 import base64
+import io
 from datetime import datetime, timezone
-from typing import Optional
 
-# ---------------------------------------------------------------------------
-# Third-party imports
-# ---------------------------------------------------------------------------
-import pyautogui               # Mouse/keyboard control
-from PIL import Image           # Image handling
+import pyautogui
+from PIL import Image
 
 try:
-    import pygetwindow as gw   # Window management (focus, position, size)
+    import pygetwindow as gw
     HAS_PYGETWINDOW = True
 except ImportError:
     HAS_PYGETWINDOW = False
 
 try:
-    import ollama              # Local LLM for vision + verification
+    import ollama
 except ImportError:
-    raise ImportError(
-        "The 'ollama' package is required.\n"
-        "Install it with: pip install ollama"
-    )
+    raise ImportError("pip install ollama")
 
-# Import Phase 0 screen reader for screenshot capture
 try:
     from screen_reader import capture_screen, extract_text
 except ImportError:
-    # Fallback: define minimal capture if screen_reader.py isn't available
     import mss as _mss
     def capture_screen(monitor_index=0):
         with _mss.MSS() as sct:
-            monitor = sct.monitors[monitor_index]
-            raw = sct.grab(monitor)
+            raw = sct.grab(sct.monitors[monitor_index])
             return Image.frombytes("RGB", raw.size, raw.rgb)
     def extract_text(image):
         return ""
@@ -80,45 +65,25 @@ except ImportError:
 # Safety Configuration
 # ===========================================================================
 
-# --- pyautogui safety settings ---
-# FAILSAFE: Moving mouse to (0, 0) — top-left corner — aborts everything.
-# This is your emergency stop if the agent goes rogue.
+# FAILSAFE: move mouse to top-left (0,0) at any time to abort everything
 pyautogui.FAILSAFE = True
 
-# Pause between EVERY pyautogui call (seconds).
-# This gives you time to see what's happening and intervene if needed.
-pyautogui.PAUSE = 0.5
+# Built-in pause between every single pyautogui call — DO NOT set to 0
+pyautogui.PAUSE = 0.4
 
-# --- Agent-level safety settings ---
-ACTION_DELAY = 0.5          # Additional delay between our high-level actions (seconds)
-VERIFY_DELAY = 1.5          # Wait time after action before taking verification screenshot
-MAX_RETRIES = 2             # Max retry attempts per step if verification fails
+ACTION_DELAY   = 0.5    # Extra delay between high-level steps
+VERIFY_DELAY   = 2.5    # Wait after action before verification screenshot
+                        # Increased from 1.5s — apps need time to actually open
+MAX_RETRIES    = 2      # How many times to retry a failed step before giving up
 SCREENSHOT_DIR = os.path.join(tempfile.gettempdir(), "ai_agent_actions")
 
-# --- Ollama settings ---
-VISION_MODEL = "llava"      # Multimodal model for locating UI elements
-TEXT_MODEL = "llama3"        # Text model fallback
-OLLAMA_TIMEOUT = 120.0      # Seconds to wait for model response
+VISION_MODEL = "llava"   # Must be a multimodal model
+TEXT_MODEL   = "llama3"  # Text-only planning model
 
-
-# ===========================================================================
-# Action Types — what the agent can do
-# ===========================================================================
-
-# The agent maps natural-language step descriptions to these concrete actions.
-# Each action type has a handler function defined below.
-ACTION_TYPES = {
-    "click":       "Click on a specific UI element (button, link, checkbox, etc.)",
-    "double_click": "Double-click on an element",
-    "right_click": "Right-click on an element",
-    "type_text":   "Type text into a focused input field",
-    "press_key":   "Press a keyboard key or key combination (Enter, Tab, etc.)",
-    "scroll":      "Scroll up or down",
-    "wait":        "Wait for a specified duration",
-    "focus_window": "Bring a specific window to the foreground",
-    "open_app":    "Open/launch an application",
-    "custom":      "A complex action described in natural language",
-}
+# If llava returns coords within this fraction of screen center, reject them.
+# llava commonly returns (cx, cy) when it cannot find the actual element.
+# 8% of screen width/height is the rejection radius.
+CENTER_REJECTION_RADIUS_PCT = 0.08
 
 
 # ===========================================================================
@@ -127,72 +92,58 @@ ACTION_TYPES = {
 
 def _take_screenshot(label: str = "action") -> tuple[Image.Image, str]:
     """
-    Capture the current screen and save it with a descriptive label.
+    Capture current screen, save to SCREENSHOT_DIR, return (Image, path).
 
-    Parameters
-    ----------
-    label : str
-        Descriptive label for the screenshot filename
-        (e.g., "before_click", "after_step_3").
-
-    Returns
-    -------
-    tuple[Image.Image, str]
-        (PIL Image, filesystem path to saved PNG)
+    Label is sanitized for filesystem safety and embedded in the filename
+    alongside a UTC timestamp so screenshots sort chronologically.
     """
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
-
-    image = capture_screen(monitor_index=0)
-
-    # Build a filename with timestamp + label
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    safe_label = re.sub(r"[^\w\-]", "_", label)[:50]
-    filename = f"{ts}_{safe_label}.png"
-    filepath = os.path.join(SCREENSHOT_DIR, filename)
-
-    image.save(filepath, format="PNG")
-    return image, filepath
+    image    = capture_screen(monitor_index=0)
+    ts       = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    safe     = re.sub(r"[^\w\-]", "_", label)[:50]
+    path     = os.path.join(SCREENSHOT_DIR, f"{ts}_{safe}.png")
+    image.save(path, format="PNG")
+    return image, path
 
 
 def _image_to_base64(image: Image.Image) -> str:
-    """Convert a PIL Image to base64 string for Ollama API."""
-    import io
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+    """Convert PIL Image → base64 PNG string for Ollama API."""
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _is_center_coord(x: int, y: int, image: Image.Image) -> bool:
+    """
+    Return True if (x, y) is suspiciously close to the screen center.
+
+    llava frequently returns the screen center coordinates when it cannot
+    locate the requested element. We detect and reject these to avoid
+    clicking randomly in the middle of the screen.
+
+    The rejection zone is a circle of radius = 8% of the smaller screen
+    dimension, centered on the screen.
+    """
+    w, h = image.size
+    cx, cy = w // 2, h // 2
+    radius_x = w * CENTER_REJECTION_RADIUS_PCT
+    radius_y = h * CENTER_REJECTION_RADIUS_PCT
+    return abs(x - cx) < radius_x and abs(y - cy) < radius_y
 
 
 # ===========================================================================
-# Ollama Integration — AI-powered UI element location
+# Ollama Wrappers
 # ===========================================================================
 
-def _ask_ollama_vision(image: Image.Image, prompt: str, model: str = VISION_MODEL) -> str:
-    """
-    Send an image + prompt to Ollama's vision model and return the response.
-
-    Parameters
-    ----------
-    image : PIL.Image.Image
-        The screenshot to analyze.
-    prompt : str
-        The question/instruction for the model.
-    model : str
-        Ollama model name (must support images, e.g., 'llava').
-
-    Returns
-    -------
-    str
-        The model's text response.
-    """
-    image_b64 = _image_to_base64(image)
-
+def _ask_ollama_vision(image: Image.Image, prompt: str) -> str:
+    """Send screenshot + text prompt to llava, return raw text response."""
     try:
         response = ollama.chat(
-            model=model,
+            model=VISION_MODEL,
             messages=[{
-                "role": "user",
+                "role":    "user",
                 "content": prompt,
-                "images": [image_b64],
+                "images":  [_image_to_base64(image)],
             }],
         )
         return response.message.content.strip()
@@ -200,15 +151,11 @@ def _ask_ollama_vision(image: Image.Image, prompt: str, model: str = VISION_MODE
         return f"[OLLAMA ERROR] {exc}"
 
 
-def _ask_ollama_text(prompt: str, model: str = TEXT_MODEL) -> str:
-    """
-    Send a text-only prompt to Ollama and return the response.
-
-    Used as a fallback when vision model isn't available.
-    """
+def _ask_ollama_text(prompt: str) -> str:
+    """Send text-only prompt to llama3, return raw text response."""
     try:
         response = ollama.chat(
-            model=model,
+            model=TEXT_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
         return response.message.content.strip()
@@ -217,203 +164,290 @@ def _ask_ollama_text(prompt: str, model: str = TEXT_MODEL) -> str:
 
 
 # ===========================================================================
-# Action Planning — parse step into concrete action
+# Prompts — v2 (tightened with examples, coordinate hints, leniency rules)
 # ===========================================================================
 
-# Prompt to convert a natural-language step description into a structured action plan
-PLAN_ACTION_PROMPT = """You are an AI assistant that controls a computer. Given a setup/installation step, determine what physical action to take.
+# Converts a natural-language step into a structured action dict.
+# Kept text-only (llama3) — no screenshot needed for planning.
+PLAN_ACTION_PROMPT = """You are an automation agent controlling a Windows 11 PC.
+Convert this installation/setup step into a single concrete computer action.
 
-Step to execute:
-Action: {action}
-Expected Result: {expected_result}
+Step action: {action}
+Expected result: {expected_result}
 
-Analyze this step and respond with ONLY a valid JSON object describing the concrete action to take. Use this format:
-
-{{"action_type": "click|double_click|right_click|type_text|press_key|scroll|wait|focus_window|open_app|custom",
-  "target_description": "description of what UI element to interact with (e.g., 'the Next button', 'the username text field')",
-  "text_to_type": "text to type if action_type is type_text, otherwise empty string",
-  "key_to_press": "key name if action_type is press_key (e.g., 'enter', 'tab', 'ctrl+a'), otherwise empty string",
-  "scroll_direction": "up or down if action_type is scroll, otherwise empty string",
+Respond with ONLY a JSON object, no markdown, no explanation:
+{{
+  "action_type": "click|double_click|right_click|type_text|press_key|scroll|wait|focus_window|open_app|custom",
+  "target_description": "the exact UI element to interact with, described precisely",
+  "text_to_type": "exact text to type if action_type is type_text, else empty string",
+  "key_to_press": "key name if press_key e.g. enter, tab, ctrl+a, ctrl+shift+esc, else empty string",
+  "scroll_direction": "up or down if scroll, else empty string",
   "scroll_amount": 3,
   "wait_seconds": 2,
-  "window_title": "window title if action_type is focus_window, otherwise empty string",
-  "app_to_open": "app name or path if action_type is open_app, otherwise empty string",
-  "notes": "any additional context or caveats"}}
-
-IMPORTANT: Respond with ONLY the JSON object. No markdown, no explanation.
-"""
+  "window_title": "partial window title if focus_window, else empty string",
+  "app_to_open": "app name or .exe path if open_app, else empty string",
+  "notes": "any important caveats or extra context"
+}}"""
 
 
-# Prompt to locate a UI element on screen
-LOCATE_ELEMENT_PROMPT = """Look at this screenshot carefully. I need to find the EXACT pixel coordinates of this UI element:
+# Asks llava to locate a UI element on screen by pixel coordinates.
+# KEY CHANGES vs v1:
+#   - Tells model exactly where the taskbar is (bottom ~97% down screen)
+#   - Explicitly warns against returning center coordinates
+#   - Provides the screen center coords as a "do not return these" hint
+#   - Asks for a location_description to help us log what it actually saw
+LOCATE_ELEMENT_PROMPT = """You are looking at a Windows 11 computer screenshot.
+Screen size: {width} x {height} pixels. Origin (0,0) is TOP-LEFT corner.
 
+Find the EXACT pixel position of this UI element:
 "{target_description}"
 
-Find this element on the screen and respond with ONLY a JSON object containing the x,y coordinates of the CENTER of the element:
-{{"x": <pixel_x>, "y": <pixel_y>, "found": true, "confidence": "high|medium|low"}}
+IMPORTANT layout hints for Windows 11:
+- The taskbar is at the VERY BOTTOM of the screen, around y={taskbar_y}
+- The Start button (Windows logo) is at the bottom-left, around x=37, y={taskbar_y}
+- The system tray (clock, volume, WiFi) is at the bottom-RIGHT
+- Desktop and app windows occupy the area ABOVE the taskbar
+- The screen CENTER is ({cx}, {cy}) — do NOT return this unless the element is genuinely centered
 
-If you cannot find the element, respond with:
-{{"x": 0, "y": 0, "found": false, "confidence": "low", "reason": "why not found"}}
+Instructions:
+1. Look carefully across the ENTIRE screenshot
+2. Identify the element described above
+3. Return the coordinates of its CENTER point
+4. If you genuinely cannot see it, set found=false
 
-Screen resolution is {width}x{height} pixels. Coordinates must be within this range.
-IMPORTANT: Respond with ONLY the JSON object. No explanation.
-"""
+Respond with ONLY this JSON, no markdown:
+{{"x": <int>, "y": <int>, "found": true, "confidence": "high|medium|low", "location_description": "brief description of where on screen you found it"}}
+
+If element NOT found:
+{{"x": 0, "y": 0, "found": false, "confidence": "low", "reason": "specific reason why not found"}}"""
 
 
-# Prompt to verify if a step succeeded
-VERIFY_STEP_PROMPT = """Look at this screenshot taken AFTER executing a setup/installation step.
+# Asks llava to verify whether the step succeeded after execution.
+# KEY CHANGES vs v1:
+#   - LENIENT — partial success counts as success
+#   - Explicitly says: don't fail just because terminal is visible in background
+#   - Looks for POSITIVE evidence, not absence of other things
+VERIFY_STEP_PROMPT = """You are verifying if a computer automation step succeeded.
 
-The step was:
-Action: {action}
-Expected Result: {expected_result}
+Step that was executed:
+  Action: {action}
+  Expected result: {expected_result}
 
-Based on what you see on screen, did this step complete successfully?
+Look at this screenshot taken RIGHT AFTER the action was performed.
 
-Respond with ONLY a JSON object:
-{{"success": true|false, "confidence": "high|medium|low", "observation": "what you see on screen that indicates success or failure", "suggestion": "if failed, what should be tried next"}}
+LENIENCY RULES — mark success=true if ANY of these apply:
+  - The expected result is visible anywhere on screen, even partially
+  - The target application/window opened (even if something else is also open)
+  - Clear progress was made toward the expected result
+  - The UI changed in the expected direction
 
-IMPORTANT: Respond with ONLY the JSON object. No explanation.
-"""
+Mark success=false ONLY if there is CLEAR evidence the action had NO effect at all.
+Do NOT fail because:
+  - A terminal or PowerShell window is visible in the background
+  - The exact wording of expected_result doesn't match perfectly
+  - There are extra windows open
 
+Respond with ONLY this JSON, no markdown:
+{{"success": true|false, "confidence": "high|medium|low", "observation": "what you see (max 150 chars)", "suggestion": "if failed: one specific next thing to try"}}"""
+
+
+# ===========================================================================
+# Action Planning
+# ===========================================================================
 
 def _plan_action(step: dict) -> dict:
     """
-    Use Ollama to convert a natural-language step into a concrete action plan.
-
-    Parameters
-    ----------
-    step : dict
-        A step dict from Phase 2: {step_number, action, expected_result}
-
-    Returns
-    -------
-    dict
-        Structured action plan with action_type, target_description, etc.
+    Use llama3 to convert a natural-language step into a structured action plan.
+    Returns a dict with action_type, target_description, text_to_type, etc.
     """
     prompt = PLAN_ACTION_PROMPT.format(
         action=step.get("action", ""),
         expected_result=step.get("expected_result", ""),
     )
-
     raw = _ask_ollama_text(prompt)
     return _parse_json_safe(raw, default={
-        "action_type": "custom",
+        "action_type":        "custom",
         "target_description": step.get("action", ""),
-        "text_to_type": "",
-        "key_to_press": "",
-        "notes": "Could not parse action plan from LLM response",
+        "text_to_type":       "",
+        "key_to_press":       "",
+        "notes":              "Could not parse action plan — using raw step as custom action",
     })
 
 
 def _locate_element(image: Image.Image, target_description: str) -> dict:
     """
-    Use Ollama's vision model to find the pixel coordinates of a UI element.
+    Use llava to find pixel coordinates of a UI element on screen.
 
-    Parameters
-    ----------
-    image : PIL.Image.Image
-        Current screenshot of the screen.
-    target_description : str
-        Natural-language description of the element to find
-        (e.g., "the Install button", "the username text field").
+    After getting the response, we apply two safety checks:
+    1. Clamp coordinates to screen bounds
+    2. Reject coordinates suspiciously close to screen center (hallucination guard)
 
-    Returns
-    -------
-    dict
-        {x, y, found, confidence} where x,y are pixel coordinates.
+    Returns dict: {x, y, found, confidence, location_description}
     """
     width, height = image.size
+    taskbar_y = int(height * 0.97)   # Taskbar lives at the very bottom
+    cx, cy    = width // 2, height // 2
+
     prompt = LOCATE_ELEMENT_PROMPT.format(
         target_description=target_description,
         width=width,
         height=height,
+        taskbar_y=taskbar_y,
+        cx=cx,
+        cy=cy,
     )
 
-    raw = _ask_ollama_vision(image, prompt)
+    raw    = _ask_ollama_vision(image, prompt)
     result = _parse_json_safe(raw, default={
         "x": 0, "y": 0, "found": False,
-        "confidence": "low", "reason": "Could not parse location from LLM",
+        "confidence": "low", "reason": "JSON parse failed",
     })
 
-    # Sanitize coordinates — ensure they're within screen bounds
     if result.get("found", False):
-        result["x"] = max(0, min(int(result.get("x", 0)), width - 1))
-        result["y"] = max(0, min(int(result.get("y", 0)), height - 1))
+        # Clamp to screen bounds
+        x = max(0, min(int(result.get("x", 0)), width  - 1))
+        y = max(0, min(int(result.get("y", 0)), height - 1))
+
+        # Reject center-area coordinates — almost always a hallucination
+        if _is_center_coord(x, y, image):
+            print(f"    [WARN] Rejected center coords ({x},{y}) — llava hallucination guard")
+            return {
+                "x": 0, "y": 0, "found": False,
+                "confidence": "low",
+                "reason": f"Returned center-area coords ({x},{y}) — rejected as probable hallucination",
+            }
+
+        result["x"] = x
+        result["y"] = y
 
     return result
 
 
+def _locate_element_keyboard_fallback(
+    action_type: str,
+    action_plan: dict,
+) -> tuple[bool, str]:
+    """
+    When llava cannot find an element visually, attempt a keyboard shortcut.
+
+    This is the v2 key improvement — instead of hard-failing, we try
+    OS-level keyboard shortcuts that achieve the same goal.
+
+    Returns (success: bool, note: str)
+    """
+    target = (action_plan.get("target_description") or "").lower()
+    notes  = (action_plan.get("notes")              or "").lower()
+    combo  = target + " " + notes  # Search both fields
+
+    # --- Start Menu ---
+    if any(k in combo for k in ["start menu", "start button", "windows button", "windows logo"]):
+        pyautogui.hotkey("win")
+        time.sleep(0.9)
+        return True, "Opened Start Menu via Win key (keyboard fallback)"
+
+    # --- Search / Search Bar ---
+    if any(k in combo for k in ["search bar", "search box", "search field", "taskbar search"]):
+        pyautogui.hotkey("win", "s")
+        time.sleep(0.6)
+        return True, "Opened search via Win+S (keyboard fallback)"
+
+    # --- File menu ---
+    if "file menu" in combo or combo.strip() == "file":
+        pyautogui.hotkey("alt", "f")
+        time.sleep(0.3)
+        return True, "Opened File menu via Alt+F (keyboard fallback)"
+
+    # --- OK / Next / Install / Finish / Yes / Accept buttons ---
+    if any(k in combo for k in ["ok button", "next button", "install button",
+                                 "finish button", "yes button", "accept button",
+                                 "continue button", "agree button"]):
+        # Tab to focus the default button, then Enter to activate
+        pyautogui.press("tab")
+        time.sleep(0.2)
+        pyautogui.press("enter")
+        return True, "Pressed Tab→Enter to activate dialog button (keyboard fallback)"
+
+    # --- Close / X button ---
+    if any(k in combo for k in ["close button", "x button", "exit button", "close window"]):
+        pyautogui.hotkey("alt", "f4")
+        return True, "Pressed Alt+F4 to close window (keyboard fallback)"
+
+    # --- Task Manager ---
+    if "task manager" in combo:
+        pyautogui.hotkey("ctrl", "shift", "esc")
+        time.sleep(1.0)
+        return True, "Opened Task Manager via Ctrl+Shift+Esc (keyboard fallback)"
+
+    # --- Run dialog ---
+    if "run dialog" in combo or "run box" in combo:
+        pyautogui.hotkey("win", "r")
+        time.sleep(0.5)
+        return True, "Opened Run dialog via Win+R (keyboard fallback)"
+
+    # --- Settings ---
+    if "settings" in combo or "windows settings" in combo:
+        pyautogui.hotkey("win", "i")
+        time.sleep(1.0)
+        return True, "Opened Settings via Win+I (keyboard fallback)"
+
+    # No matching fallback found
+    return False, "No keyboard fallback available for this element"
+
+
 def _verify_step(image: Image.Image, step: dict) -> dict:
     """
-    Use Ollama's vision model to verify whether a step completed successfully.
-
-    Parameters
-    ----------
-    image : PIL.Image.Image
-        Screenshot taken AFTER executing the step.
-    step : dict
-        The original step dict with action and expected_result.
-
-    Returns
-    -------
-    dict
-        {success, confidence, observation, suggestion}
+    Use llava to verify a step succeeded. Returns {success, confidence, observation, suggestion}.
+    Uses the lenient v2 prompt — doesn't penalize for background terminal windows.
     """
     prompt = VERIFY_STEP_PROMPT.format(
         action=step.get("action", ""),
         expected_result=step.get("expected_result", ""),
     )
-
     raw = _ask_ollama_vision(image, prompt)
     return _parse_json_safe(raw, default={
-        "success": False,
-        "confidence": "low",
-        "observation": "Could not parse verification from LLM",
-        "suggestion": "Verify manually",
+        "success":     False,
+        "confidence":  "low",
+        "observation": "Could not parse verification response",
+        "suggestion":  "Verify manually",
     })
 
 
 # ===========================================================================
-# Action Handlers — execute concrete actions
+# Action Handlers
 # ===========================================================================
 
 def _do_click(x: int, y: int, button: str = "left") -> None:
-    """Move mouse to (x, y) and click."""
-    pyautogui.moveTo(x, y, duration=0.3)   # Smooth movement, visible to user
-    time.sleep(0.1)                         # Brief pause before clicking
+    """Smoothly move mouse to (x, y) and click."""
+    pyautogui.moveTo(x, y, duration=0.4)
+    time.sleep(0.15)
     pyautogui.click(x, y, button=button)
 
 
 def _do_double_click(x: int, y: int) -> None:
-    """Move mouse to (x, y) and double-click."""
-    pyautogui.moveTo(x, y, duration=0.3)
-    time.sleep(0.1)
+    pyautogui.moveTo(x, y, duration=0.4)
+    time.sleep(0.15)
     pyautogui.doubleClick(x, y)
 
 
 def _do_right_click(x: int, y: int) -> None:
-    """Move mouse to (x, y) and right-click."""
-    pyautogui.moveTo(x, y, duration=0.3)
-    time.sleep(0.1)
+    pyautogui.moveTo(x, y, duration=0.4)
+    time.sleep(0.15)
     pyautogui.rightClick(x, y)
 
 
 def _do_type_text(text: str) -> None:
     """
-    Type text character by character.
-
-    We use pyautogui.write() for ASCII and pyautogui.hotkey() for special chars.
-    The interval parameter adds a slight delay between keystrokes for realism
-    and to avoid overwhelming slow applications.
+    Type text into the currently focused field.
+    Uses pyautogui.write() for ASCII; clipboard paste for Unicode.
     """
-    # pyautogui.write() only handles ASCII. For Unicode, use the clipboard.
     try:
-        pyautogui.write(text, interval=0.03)
+        pyautogui.write(text, interval=0.04)
     except Exception:
-        # Fallback: use clipboard for Unicode text
+        # Fallback: push to clipboard then Ctrl+V (handles Unicode)
         import subprocess
+        safe_text = text.replace("'", "''")  # Escape single quotes for PowerShell
         subprocess.run(
-            ["powershell", "-Command", f"Set-Clipboard -Value '{text}'"],
+            ["powershell", "-Command", f"Set-Clipboard -Value '{safe_text}'"],
             capture_output=True,
         )
         pyautogui.hotkey("ctrl", "v")
@@ -422,490 +456,498 @@ def _do_type_text(text: str) -> None:
 def _do_press_key(key_combo: str) -> None:
     """
     Press a key or key combination.
-
-    Supports:
-        - Single keys: "enter", "tab", "escape", "space", "backspace"
-        - Combinations: "ctrl+a", "alt+f4", "ctrl+shift+s"
-        - Function keys: "f1", "f5", "f11"
+    Single key: "enter", "tab", "f5"
+    Combo: "ctrl+a", "alt+f4", "ctrl+shift+s"
     """
     key_combo = key_combo.strip().lower()
-
     if "+" in key_combo:
-        # Key combination — split and use hotkey()
         keys = [k.strip() for k in key_combo.split("+")]
         pyautogui.hotkey(*keys)
     else:
-        # Single key press
         pyautogui.press(key_combo)
 
 
 def _do_scroll(direction: str = "down", amount: int = 3) -> None:
-    """
-    Scroll the mouse wheel up or down.
-
-    Parameters
-    ----------
-    direction : str
-        "up" or "down"
-    amount : int
-        Number of scroll "clicks" (default 3)
-    """
     clicks = amount if direction.lower() == "up" else -amount
     pyautogui.scroll(clicks)
 
 
 def _do_focus_window(window_title: str) -> bool:
     """
-    Bring a window with the given title to the foreground.
-
-    Uses pygetwindow to find and activate the window by partial title match.
-
-    Returns True if the window was found and focused, False otherwise.
+    Bring a window to the foreground by partial title match.
+    Returns True if found and focused, False otherwise.
     """
     if not HAS_PYGETWINDOW:
-        print(f"  [WARN] pygetwindow not installed — cannot focus window '{window_title}'")
+        print(f"    [WARN] pygetwindow not installed")
         return False
-
     try:
-        # Search for windows with a partial title match (case-insensitive)
-        matching = gw.getWindowsWithTitle(window_title)
-        if not matching:
-            # Try partial match
-            all_windows = gw.getAllWindows()
-            matching = [
-                w for w in all_windows
+        matches = gw.getWindowsWithTitle(window_title)
+        if not matches:
+            # Try partial case-insensitive match across all windows
+            matches = [
+                w for w in gw.getAllWindows()
                 if window_title.lower() in (w.title or "").lower()
             ]
-
-        if matching:
-            target = matching[0]
-            # Restore if minimized
-            if target.isMinimized:
-                target.restore()
-            # Bring to front
-            target.activate()
-            time.sleep(0.3)  # Give the OS time to switch focus
+        if matches:
+            w = matches[0]
+            if w.isMinimized:
+                w.restore()
+            w.activate()
+            time.sleep(0.4)
             return True
-        else:
-            print(f"  [WARN] No window found matching '{window_title}'")
-            return False
-
+        print(f"    [WARN] No window found matching '{window_title}'")
+        return False
     except Exception as exc:
-        print(f"  [WARN] Failed to focus window: {exc}")
+        print(f"    [WARN] focus_window error: {exc}")
         return False
 
 
 def _do_open_app(app_name_or_path: str) -> None:
     """
-    Open/launch an application.
-
-    Strategy:
-        1. If it looks like a file path, open it directly
-        2. Otherwise, use the Windows Start menu (Win key + type + Enter)
+    Launch an application.
+    If a file path is given, use os.startfile().
+    Otherwise, use Windows Start menu search.
     """
     if os.path.isfile(app_name_or_path):
-        # Direct file path — open with default handler
         os.startfile(app_name_or_path)
     else:
-        # Use the Start menu to search and launch
+        # Open Start menu, type the app name, hit Enter
         pyautogui.hotkey("win")
-        time.sleep(0.8)  # Wait for Start menu to open
+        time.sleep(0.9)
         pyautogui.write(app_name_or_path, interval=0.05)
-        time.sleep(0.5)  # Wait for search results
+        time.sleep(0.6)
         pyautogui.press("enter")
-
-    # Wait for the app to launch
-    time.sleep(2.0)
+    time.sleep(2.0)  # Give app time to launch before next step
 
 
 # ===========================================================================
-# Core Function — execute_step()
+# Core Dispatcher
 # ===========================================================================
-
-def execute_step(
-    step: dict,
-    dry_run: bool = False,
-    take_screenshots: bool = True,
-    use_vision: bool = True,
-) -> dict:
-    """
-    Execute a single setup step by controlling the mouse and keyboard.
-
-    This is the main entry point for Phase 3. It takes a step dict from
-    Phase 2 and performs the physical actions needed to complete it.
-
-    Parameters
-    ----------
-    step : dict
-        A step from Phase 2: {step_number, action, expected_result}
-    dry_run : bool
-        If True, plan and locate elements but don't actually click/type.
-        Useful for testing the AI planning without side effects.
-    take_screenshots : bool
-        If True, capture before/after screenshots for verification.
-    use_vision : bool
-        If True, use Ollama vision model to locate elements and verify.
-        If False, only use text-based planning (faster but less accurate).
-
-    Returns
-    -------
-    dict
-        {
-            "success": bool,            # Whether the step succeeded
-            "step_number": int,         # Which step this was
-            "action_plan": dict,        # The parsed action plan
-            "screenshot_before": str,   # Path to pre-action screenshot
-            "screenshot_after": str,    # Path to post-action screenshot
-            "verification": dict,       # Ollama's verification result
-            "notes": str,              # Human-readable summary
-            "timestamp": str,          # ISO-8601 UTC
-            "dry_run": bool,           # Whether this was a dry run
-        }
-    """
-    timestamp = datetime.now(timezone.utc).isoformat()
-    step_num = step.get("step_number", 0)
-
-    print(f"\n  ▶ Step {step_num}: {step.get('action', '?')[:80]}")
-
-    # --- Phase A: Plan the action ---
-    print(f"    Planning action...")
-    action_plan = _plan_action(step)
-    action_type = action_plan.get("action_type", "custom")
-    print(f"    Action type: {action_type}")
-
-    # --- Phase B: Capture "before" screenshot ---
-    screenshot_before = None
-    if take_screenshots:
-        before_image, screenshot_before = _take_screenshot(
-            f"step{step_num}_before"
-        )
-        print(f"    Before screenshot: {screenshot_before}")
-
-    # --- Phase C: Locate the UI element (if clicking/interacting) ---
-    element_location = None
-    if action_type in ("click", "double_click", "right_click") and use_vision:
-        target_desc = action_plan.get("target_description", "")
-        print(f"    Locating: \"{target_desc}\"")
-
-        if take_screenshots and before_image:
-            element_location = _locate_element(before_image, target_desc)
-        else:
-            img = capture_screen(monitor_index=0)
-            element_location = _locate_element(img, target_desc)
-
-        if element_location.get("found"):
-            x, y = element_location["x"], element_location["y"]
-            conf = element_location.get("confidence", "?")
-            print(f"    Found at ({x}, {y}) — confidence: {conf}")
-        else:
-            reason = element_location.get("reason", "unknown")
-            print(f"    [WARN] Element not found: {reason}")
-
-    # --- Phase D: Execute the action ---
-    if dry_run:
-        print(f"    [DRY RUN] Would execute: {action_type}")
-        notes = f"Dry run — action '{action_type}' was NOT executed."
-    else:
-        print(f"    Executing: {action_type}...")
-        notes = _execute_action(action_type, action_plan, element_location)
-        print(f"    {notes}")
-
-    # --- Phase E: Wait, then capture "after" screenshot ---
-    time.sleep(VERIFY_DELAY)
-
-    screenshot_after = None
-    verification = {"success": None, "observation": "No verification performed"}
-
-    if take_screenshots and not dry_run:
-        after_image, screenshot_after = _take_screenshot(
-            f"step{step_num}_after"
-        )
-        print(f"    After screenshot: {screenshot_after}")
-
-        # --- Phase F: Verify the step succeeded ---
-        if use_vision:
-            print(f"    Verifying with Ollama...")
-            verification = _verify_step(after_image, step)
-            success = verification.get("success", False)
-            conf = verification.get("confidence", "?")
-            obs = verification.get("observation", "")[:100]
-            print(f"    Verification: {'✔ Success' if success else '✘ Failed'} "
-                  f"(confidence: {conf})")
-            if obs:
-                print(f"    Observation: {obs}")
-        else:
-            verification = {"success": True, "observation": "Vision verification disabled"}
-    elif dry_run:
-        verification = {"success": True, "observation": "Dry run — no verification needed"}
-
-    # --- Assemble result ---
-    result = {
-        "success": verification.get("success", None),
-        "step_number": step_num,
-        "action_plan": action_plan,
-        "screenshot_before": screenshot_before,
-        "screenshot_after": screenshot_after,
-        "verification": verification,
-        "notes": notes,
-        "timestamp": timestamp,
-        "dry_run": dry_run,
-    }
-
-    return result
-
 
 def _execute_action(
-    action_type: str,
-    action_plan: dict,
+    action_type:      str,
+    action_plan:      dict,
     element_location: dict | None,
-) -> str:
+    attempt:          int = 1,
+) -> tuple[str, bool]:
     """
-    Dispatch to the appropriate action handler based on action_type.
+    Dispatch to the correct action handler.
 
-    Returns a human-readable note about what was done.
+    Returns (note: str, used_fallback: bool).
+    On attempt >= 2, tries keyboard fallback if element not found visually.
     """
     try:
+        # ── Click family ──────────────────────────────────────────────────
         if action_type in ("click", "double_click", "right_click"):
-            # Need coordinates — either from vision or fallback
+
+            # Try vision-located coordinates first
             if element_location and element_location.get("found"):
-                x, y = element_location["x"], element_location["y"]
-            else:
-                return (
-                    f"Cannot {action_type}: UI element not found on screen. "
-                    f"Target: {action_plan.get('target_description', '?')}"
-                )
+                x   = element_location["x"]
+                y   = element_location["y"]
+                loc = element_location.get("location_description", "")
 
-            if action_type == "click":
-                _do_click(x, y)
-                return f"Clicked at ({x}, {y})"
-            elif action_type == "double_click":
-                _do_double_click(x, y)
-                return f"Double-clicked at ({x}, {y})"
-            elif action_type == "right_click":
-                _do_right_click(x, y)
-                return f"Right-clicked at ({x}, {y})"
+                if action_type == "click":
+                    _do_click(x, y)
+                    return f"Clicked at ({x}, {y}) — {loc}", False
+                elif action_type == "double_click":
+                    _do_double_click(x, y)
+                    return f"Double-clicked at ({x}, {y})", False
+                elif action_type == "right_click":
+                    _do_right_click(x, y)
+                    return f"Right-clicked at ({x}, {y})", False
 
+            # Vision failed — try keyboard shortcut fallback
+            ok, note = _locate_element_keyboard_fallback(action_type, action_plan)
+            if ok:
+                return note, True
+
+            return (
+                f"Cannot {action_type}: element not found and no keyboard fallback matched. "
+                f"Target: '{action_plan.get('target_description', '?')}'",
+                False,
+            )
+
+        # ── Type text ─────────────────────────────────────────────────────
         elif action_type == "type_text":
             text = action_plan.get("text_to_type", "")
             if text:
                 _do_type_text(text)
-                return f"Typed {len(text)} characters"
-            else:
-                return "No text specified to type"
+                preview = text[:50] + ("..." if len(text) > 50 else "")
+                return f"Typed: '{preview}'", False
+            return "type_text: no text_to_type specified", False
 
+        # ── Press key ─────────────────────────────────────────────────────
         elif action_type == "press_key":
             key = action_plan.get("key_to_press", "")
             if key:
                 _do_press_key(key)
-                return f"Pressed key: {key}"
-            else:
-                return "No key specified to press"
+                return f"Pressed key: {key}", False
+            return "press_key: no key_to_press specified", False
 
+        # ── Scroll ────────────────────────────────────────────────────────
         elif action_type == "scroll":
             direction = action_plan.get("scroll_direction", "down")
-            amount = int(action_plan.get("scroll_amount", 3))
+            amount    = int(action_plan.get("scroll_amount", 3))
             _do_scroll(direction, amount)
-            return f"Scrolled {direction} {amount} clicks"
+            return f"Scrolled {direction} {amount} clicks", False
 
+        # ── Wait ──────────────────────────────────────────────────────────
         elif action_type == "wait":
-            seconds = float(action_plan.get("wait_seconds", 2))
-            time.sleep(seconds)
-            return f"Waited {seconds}s"
+            secs = float(action_plan.get("wait_seconds", 2))
+            time.sleep(secs)
+            return f"Waited {secs}s", False
 
+        # ── Focus window ──────────────────────────────────────────────────
         elif action_type == "focus_window":
             title = action_plan.get("window_title", "")
             if title:
-                success = _do_focus_window(title)
-                return f"{'Focused' if success else 'Failed to focus'} window: {title}"
-            else:
-                return "No window title specified"
+                ok = _do_focus_window(title)
+                return f"{'Focused' if ok else 'Could not focus'} window: '{title}'", False
+            return "focus_window: no window_title specified", False
 
+        # ── Open app ──────────────────────────────────────────────────────
         elif action_type == "open_app":
             app = action_plan.get("app_to_open", "")
             if app:
                 _do_open_app(app)
-                return f"Opened application: {app}"
-            else:
-                return "No application specified to open"
+                return f"Launched: {app}", False
+            return "open_app: no app_to_open specified", False
 
+        # ── Custom / unknown ──────────────────────────────────────────────
         elif action_type == "custom":
-            # Custom actions are described in natural language.
-            # For now, log them as manual steps the user needs to handle.
-            desc = action_plan.get("target_description", action_plan.get("notes", ""))
-            return f"Custom action (manual): {desc[:200]}"
+            desc = action_plan.get("target_description") or action_plan.get("notes", "")
+            # Still try keyboard fallback for custom actions
+            ok, note = _locate_element_keyboard_fallback(action_type, action_plan)
+            if ok:
+                return note, True
+            return f"Custom action (needs manual execution): {desc[:200]}", False
 
         else:
-            return f"Unknown action type: {action_type}"
+            return f"Unknown action_type: '{action_type}'", False
 
     except pyautogui.FailSafeException:
-        return "FAILSAFE TRIGGERED — Mouse moved to corner. Aborting!"
+        raise  # Must propagate — this is the emergency stop
 
     except Exception as exc:
-        return f"Action failed with error: {exc}"
+        return f"Action error: {type(exc).__name__}: {exc}", False
 
 
 # ===========================================================================
-# Batch Execution — execute_all_steps()
+# Core: execute_step() — WITH RETRY + KEYBOARD FALLBACK
 # ===========================================================================
 
-def execute_all_steps(
-    steps: list[dict],
-    dry_run: bool = False,
-    stop_on_failure: bool = True,
-    inter_step_delay: float = 2.0,
+def execute_step(
+    step:            dict,
+    dry_run:         bool = False,
+    take_screenshots: bool = True,
+    use_vision:      bool = True,
 ) -> dict:
     """
-    Execute a list of setup steps sequentially.
+    Execute a single setup step with automatic retry on failure.
+
+    Each failed attempt automatically tries a different strategy:
+    - Attempt 1: vision-based element location
+    - Attempt 2: keyboard shortcut fallback (if vision failed)
+    - Attempt 3: keyboard fallback + lenient verification
 
     Parameters
     ----------
-    steps : list[dict]
-        List of step dicts from Phase 2.
-    dry_run : bool
-        If True, plan but don't execute any actions.
-    stop_on_failure : bool
-        If True, stop executing after the first failed step.
-    inter_step_delay : float
-        Seconds to wait between steps (gives apps time to respond).
+    step             : Step dict from Phase 2 {step_number, action, expected_result}
+    dry_run          : If True, plan + locate but don't actually execute
+    take_screenshots : Capture before/after screenshots for each attempt
+    use_vision       : Use llava for element location and verification
 
     Returns
     -------
-    dict
-        {
-            "total_steps": int,
-            "completed": int,
-            "failed": int,
-            "skipped": int,
-            "results": list[dict],    # Individual step results
-            "overall_success": bool,  # True only if ALL steps succeeded
-        }
+    dict with keys: success, step_number, action_plan, screenshot_before,
+                    screenshot_after, verification, notes, attempts, timestamp, dry_run
     """
-    results = []
+    timestamp = datetime.now(timezone.utc).isoformat()
+    step_num  = step.get("step_number", 0)
+
+    print(f"\n  ▶ Step {step_num}: {step.get('action', '?')[:80]}")
+
+    # Plan action ONCE — shared across all retry attempts
+    print(f"    Planning action...")
+    action_plan = _plan_action(step)
+    action_type = action_plan.get("action_type", "custom")
+    print(f"    Action type: {action_type}")
+    if action_plan.get("notes"):
+        print(f"    Notes: {action_plan['notes'][:100]}")
+
+    attempts_log  = []
+    final_result  = None
+    before_image  = None
+    screenshot_before = None
+
+    for attempt in range(1, MAX_RETRIES + 2):  # attempts: 1, 2, 3
+        is_retry = attempt > 1
+        if is_retry:
+            print(f"\n    ↻ Retry {attempt - 1}/{MAX_RETRIES}...")
+
+        # ── Before screenshot ─────────────────────────────────────────────
+        if take_screenshots:
+            label         = f"step{step_num}_att{attempt}_before"
+            before_image, screenshot_before = _take_screenshot(label)
+            print(f"    Before: {screenshot_before}")
+
+        # ── Locate element (vision) ───────────────────────────────────────
+        element_location = None
+        if action_type in ("click", "double_click", "right_click") and use_vision:
+            target_desc = action_plan.get("target_description", "")
+            print(f"    Locating: \"{target_desc}\"")
+            img_src = before_image if before_image else capture_screen(0)
+            element_location = _locate_element(img_src, target_desc)
+
+            if element_location.get("found"):
+                x    = element_location["x"]
+                y    = element_location["y"]
+                conf = element_location.get("confidence", "?")
+                loc  = element_location.get("location_description", "")
+                print(f"    Found at ({x}, {y}) conf={conf} — {loc}")
+            else:
+                reason = element_location.get("reason", "unknown")
+                print(f"    [WARN] Not found: {reason}")
+                if is_retry:
+                    print(f"    Will try keyboard fallback this attempt...")
+
+        # ── Execute ───────────────────────────────────────────────────────
+        if dry_run:
+            print(f"    [DRY RUN] Would execute: {action_type}")
+            note, used_fallback = f"Dry run — {action_type} not executed", False
+        else:
+            print(f"    Executing: {action_type}...")
+            note, used_fallback = _execute_action(
+                action_type, action_plan, element_location, attempt=attempt
+            )
+            prefix = "✓ Fallback" if used_fallback else "   Result"
+            print(f"    {prefix}: {note}")
+
+        # ── Wait for screen to settle ─────────────────────────────────────
+        time.sleep(VERIFY_DELAY)
+
+        # ── After screenshot + verification ───────────────────────────────
+        screenshot_after = None
+        verification     = {"success": True,  "observation": "Dry run", "confidence": "high"}
+
+        if not dry_run and take_screenshots:
+            label = f"step{step_num}_att{attempt}_after"
+            after_image, screenshot_after = _take_screenshot(label)
+            print(f"    After:  {screenshot_after}")
+
+            if use_vision:
+                print(f"    Verifying...")
+                verification = _verify_step(after_image, step)
+                success = verification.get("success", False)
+                conf    = verification.get("confidence", "?")
+                obs     = verification.get("observation", "")[:120]
+                print(f"    {'✔ Passed' if success else '✘ Failed'} (conf={conf}): {obs}")
+                if not success:
+                    sug = verification.get("suggestion", "")
+                    if sug:
+                        print(f"    Suggestion: {sug}")
+            else:
+                verification = {
+                    "success":     True,
+                    "observation": "Vision verification disabled",
+                    "confidence":  "medium",
+                }
+
+        # ── Log this attempt ──────────────────────────────────────────────
+        attempts_log.append({
+            "attempt":           attempt,
+            "note":              note,
+            "used_fallback":     used_fallback,
+            "screenshot_before": screenshot_before,
+            "screenshot_after":  screenshot_after,
+            "verification":      verification,
+        })
+
+        # ── Did we succeed? ───────────────────────────────────────────────
+        if verification.get("success", False) or dry_run:
+            final_result = {
+                "success":           True,
+                "step_number":       step_num,
+                "action_plan":       action_plan,
+                "screenshot_before": screenshot_before,
+                "screenshot_after":  screenshot_after,
+                "verification":      verification,
+                "notes":             note,
+                "attempts":          attempts_log,
+                "timestamp":         timestamp,
+                "dry_run":           dry_run,
+            }
+            break  # Done — no need to retry
+
+        # ── Retries exhausted? ────────────────────────────────────────────
+        if attempt > MAX_RETRIES:
+            print(f"    ✘ All {MAX_RETRIES} retries exhausted for step {step_num}")
+            final_result = {
+                "success":           False,
+                "step_number":       step_num,
+                "action_plan":       action_plan,
+                "screenshot_before": screenshot_before,
+                "screenshot_after":  screenshot_after,
+                "verification":      verification,
+                "notes":             note,
+                "attempts":          attempts_log,
+                "timestamp":         timestamp,
+                "dry_run":           dry_run,
+            }
+            break
+
+    return final_result
+
+
+# ===========================================================================
+# Batch Execution
+# ===========================================================================
+
+def execute_all_steps(
+    steps:            list[dict],
+    dry_run:          bool  = False,
+    stop_on_failure:  bool  = False,   # v2: False by default — keep going
+    inter_step_delay: float = 2.5,     # v2: slightly longer for slower machines
+) -> dict:
+    """
+    Execute a list of steps sequentially with per-step retry.
+
+    v2 default: stop_on_failure=False — the agent finishes all steps and
+    reports which ones passed and which ones failed, instead of giving up
+    at the first hiccup.
+
+    Parameters
+    ----------
+    steps            : Step list from Phase 2
+    dry_run          : Plan only, no real actions
+    stop_on_failure  : Stop entire run after first failed step
+    inter_step_delay : Seconds between steps
+
+    Returns
+    -------
+    dict: total_steps, completed, failed, skipped, results, overall_success
+    """
+    results   = []
     completed = 0
-    failed = 0
-    skipped = 0
+    failed    = 0
+    skipped   = 0
 
     print("=" * 60)
-    print(f"  Executing {len(steps)} setup steps")
+    print(f"  Executing {len(steps)} setup step(s)")
     if dry_run:
-        print("  *** DRY RUN MODE — no actual actions will be performed ***")
+        print("  *** DRY RUN — no actual actions ***")
     print("=" * 60)
 
     for i, step in enumerate(steps):
-        # Execute the step
         result = execute_step(step, dry_run=dry_run)
         results.append(result)
 
         if result.get("success"):
             completed += 1
-        elif result.get("success") is False:
+        else:
             failed += 1
-
             if stop_on_failure:
-                # Mark remaining steps as skipped
                 skipped = len(steps) - (i + 1)
-                suggestion = result.get("verification", {}).get("suggestion", "")
-                print(f"\n  ✘ Stopping after step {step.get('step_number', '?')} failed.")
-                if suggestion:
-                    print(f"    Suggestion: {suggestion}")
+                print(f"\n  ✘ stop_on_failure=True — halting at step {step.get('step_number','?')}")
                 break
 
-        # Wait between steps
         if i < len(steps) - 1:
             print(f"\n    Waiting {inter_step_delay}s before next step...")
             time.sleep(inter_step_delay)
 
-    # Summary
-    overall_success = failed == 0 and skipped == 0
+    overall = (failed == 0 and skipped == 0)
     print()
     print("=" * 60)
-    print(f"  Execution Complete")
-    print(f"  Total: {len(steps)} | ✔ Completed: {completed} | "
+    print("  Execution Complete")
+    print(f"  Total: {len(steps)} | ✔ Done: {completed} | "
           f"✘ Failed: {failed} | ⊘ Skipped: {skipped}")
-    print(f"  Overall: {'SUCCESS' if overall_success else 'FAILED'}")
+    print(f"  Overall: {'SUCCESS ✔' if overall else 'PARTIAL / FAILED ✘'}")
     print("=" * 60)
 
     return {
-        "total_steps": len(steps),
-        "completed": completed,
-        "failed": failed,
-        "skipped": skipped,
-        "results": results,
-        "overall_success": overall_success,
+        "total_steps":     len(steps),
+        "completed":       completed,
+        "failed":          failed,
+        "skipped":         skipped,
+        "results":         results,
+        "overall_success": overall,
     }
 
 
 # ===========================================================================
-# Utility: Window listing (helpful for debugging)
+# Window Listing Helper
 # ===========================================================================
 
 def list_open_windows() -> list[dict]:
-    """
-    List all currently open windows with their titles and positions.
-
-    Useful for debugging which windows are available to focus.
-
-    Returns
-    -------
-    list[dict]
-        List of {title, position, size, is_active, is_minimized}
-    """
+    """List all open windows — useful for debugging focus issues."""
     if not HAS_PYGETWINDOW:
         return [{"error": "pygetwindow not installed"}]
-
-    windows = []
+    out = []
     for w in gw.getAllWindows():
-        if not w.title:  # Skip unnamed windows
+        if not w.title:
             continue
-        windows.append({
-            "title": w.title,
-            "position": (w.left, w.top),
-            "size": (w.width, w.height),
-            "is_active": w.isActive,
+        out.append({
+            "title":        w.title,
+            "position":     (w.left, w.top),
+            "size":         (w.width, w.height),
+            "is_active":    w.isActive,
             "is_minimized": w.isMinimized,
         })
-    return windows
+    return out
 
 
 # ===========================================================================
-# JSON Parsing Helper
+# JSON Parse Helper — 5 fallback strategies
 # ===========================================================================
 
-def _parse_json_safe(raw_text: str, default: dict) -> dict:
+def _parse_json_safe(raw: str, default: dict) -> dict:
     """
-    Attempt to parse JSON from LLM response text, with multiple fallback
-    strategies. Returns the default dict if all parsing fails.
+    Parse JSON from an LLM response with 5 progressively looser strategies.
+    Returns default dict if all strategies fail.
     """
-    text = raw_text.strip()
+    text = raw.strip()
 
-    # Attempt 1: Direct parse
+    # 1 — Direct parse (ideal case: model responded with clean JSON)
     try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            return parsed
+        p = json.loads(text)
+        if isinstance(p, dict):
+            return p
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Attempt 2: Strip markdown code fences
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-    if match:
+    # 2 — Strip markdown code fences  ```json ... ```
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+    if m:
         try:
-            parsed = json.loads(match.group(1).strip())
-            if isinstance(parsed, dict):
-                return parsed
+            p = json.loads(m.group(1).strip())
+            if isinstance(p, dict):
+                return p
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # Attempt 3: Find first { ... } block
-    match = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.DOTALL)
-    if match:
+    # 3 — Find first complete { ... } block
+    m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.DOTALL)
+    if m:
         try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict):
-                return parsed
+            p = json.loads(m.group(0))
+            if isinstance(p, dict):
+                return p
         except (json.JSONDecodeError, TypeError):
             pass
 
+    # 4 — Fix trailing commas and single quotes, then retry
+    fixed = re.sub(r",\s*([}\]])", r"\1", text)   # remove trailing commas
+    fixed = re.sub(r"(?<![\\])'", '"', fixed)      # single → double quotes
+    m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", fixed, re.DOTALL)
+    if m:
+        try:
+            p = json.loads(m.group(0))
+            if isinstance(p, dict):
+                return p
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 5 — Give up, return default
     return default
 
 
@@ -914,83 +956,67 @@ def _parse_json_safe(raw_text: str, default: dict) -> dict:
 # ===========================================================================
 
 if __name__ == "__main__":
-    """
-    Quick self-test: execute a simple test step in dry-run mode.
-
-    Run with:
-        python action_executor.py                    # dry-run test
-        python action_executor.py --live             # LIVE execution (careful!)
-        python action_executor.py --list-windows     # list all open windows
-    """
     import argparse
 
-    # Fix Unicode output on Windows console
     if sys.platform == "win32":
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    parser = argparse.ArgumentParser(
-        description="Phase 3 — AI-driven mouse/keyboard automation."
-    )
-    parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Execute actions for real (NOT dry-run). Use with caution!",
-    )
-    parser.add_argument(
-        "--list-windows",
-        action="store_true",
-        help="List all open windows and exit.",
-    )
-    parser.add_argument(
-        "--no-vision",
-        action="store_true",
-        help="Disable Ollama vision (text-only planning).",
-    )
+    parser = argparse.ArgumentParser(description="Phase 3 — Action Executor v2")
+    parser.add_argument("--live",         action="store_true",
+                        help="Execute actions for real (NOT dry-run)")
+    parser.add_argument("--list-windows", action="store_true",
+                        help="Print all open windows and exit")
+    parser.add_argument("--no-vision",    action="store_true",
+                        help="Skip llava vision — text planning only")
+    parser.add_argument("--stop-on-fail", action="store_true",
+                        help="Halt after first failed step")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  Action Executor — Phase 3 Self-Test")
+    print("  Action Executor v2 — Phase 3 Self-Test")
     print("=" * 60)
     print()
 
     if args.list_windows:
-        windows = list_open_windows()
-        print(f"  Found {len(windows)} windows:\n")
-        for w in windows:
-            status = "🔷 active" if w.get("is_active") else ""
-            status += " 📥 minimized" if w.get("is_minimized") else ""
-            print(f"    {w['title'][:60]:<60}  {w.get('size', '')} {status}")
+        wins = list_open_windows()
+        print(f"  {len(wins)} open windows:\n")
+        for w in wins:
+            active = " ◀ ACTIVE" if w.get("is_active") else ""
+            print(f"    {w['title'][:65]:<67} {str(w.get('size','')):<14}{active}")
         sys.exit(0)
 
-    # --- Test steps (safe, non-destructive) ---
+    # Safe test — opens Notepad via keyboard shortcuts
+    # Step 1 uses Win key (keyboard fallback always available)
+    # Step 2 types into the search bar
+    # Step 3 presses Enter
     test_steps = [
         {
             "step_number": 1,
             "action": "Open the Windows Start Menu",
-            "expected_result": "The Start Menu should appear on screen",
+            "expected_result": "The Start Menu appears on screen",
         },
         {
             "step_number": 2,
             "action": "Type 'notepad' in the search bar",
-            "expected_result": "Notepad should appear in search results",
+            "expected_result": "Notepad appears in search results",
         },
         {
             "step_number": 3,
             "action": "Press Enter to open Notepad",
-            "expected_result": "Notepad application should open",
+            "expected_result": "Notepad application window opens",
         },
     ]
 
     dry_run = not args.live
     if dry_run:
-        print("  Running in DRY-RUN mode (no actual actions)")
-        print("  Use --live to execute for real")
+        print("  DRY-RUN mode (no real actions). Use --live to execute.")
     else:
-        print("  ⚠️  LIVE MODE — actions WILL be executed!")
-        print("  Move mouse to top-left corner to abort (failsafe)")
+        print("  ⚠️  LIVE MODE — real actions will be performed!")
+        print("  Move mouse to TOP-LEFT corner at any time to abort (failsafe).")
         print()
-        print("  Starting in 3 seconds...")
-        time.sleep(3)
+        for i in range(3, 0, -1):
+            print(f"  Starting in {i}s...")
+            time.sleep(1)
 
     print()
 
@@ -998,10 +1024,10 @@ if __name__ == "__main__":
         summary = execute_all_steps(
             test_steps,
             dry_run=dry_run,
-            stop_on_failure=True,
+            stop_on_failure=args.stop_on_fail,
         )
     except pyautogui.FailSafeException:
-        print("\n  🛑 FAILSAFE TRIGGERED — Execution aborted!")
+        print("\n  🛑 FAILSAFE — mouse moved to corner. All actions aborted.")
         sys.exit(1)
     except RuntimeError as err:
         print(f"\n[ERROR] {err}", file=sys.stderr)

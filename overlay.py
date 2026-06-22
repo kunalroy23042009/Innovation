@@ -1,17 +1,18 @@
 """
-overlay.py — Phase 5: Floating Overlay UI for the AI Agent
-==========================================================
+overlay.py — Floating Overlay UI for the AI Agent
+==================================================
 
-This module provides a floating, always-on-top, semi-transparent widget using
-Tkinter. It listens for a global hotkey (Ctrl+Space) to show/hide itself.
+A floating, always-on-top, semi-transparent widget using Tkinter.
+Press Ctrl+Space (configurable) to show/hide the overlay.
 
 Features:
-    - Draggable window with custom dark mode styling
-    - Global hotkey using the `keyboard` module
-    - Input text box for giving the agent commands
-    - Live status updates from the agent
-    - "Abort" button to stop the agent safely
-    - Threaded execution so the UI remains responsive while the agent runs
+    - Draggable, borderless window with dark Catppuccin-inspired styling
+    - Scrollable, timestamped activity log (replaces single-line status)
+    - Command input history: cycle with Up/Down arrow keys
+    - Cooperative agent abort via threading.Event
+    - Color-coded status indicator (idle / running / error / done)
+    - Resizable window (drag bottom-right corner)
+    - Global hotkey via the `keyboard` module
 
 Dependencies:
     pip install keyboard
@@ -21,20 +22,20 @@ Usage:
     (Then press Ctrl+Space to toggle the overlay)
 """
 
-import os
 import sys
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
+from datetime import datetime
 import time
 
 try:
     import keyboard
 except ImportError:
-    raise ImportError("The 'keyboard' package is required. Install it with: pip install keyboard")
+    raise ImportError(
+        "The 'keyboard' package is required. Install it with: pip install keyboard"
+    )
 
-# Import the Phase 4 orchestrator.
-# We assume agent_graph.py is in the same directory.
 try:
     import agent_graph
 except ImportError:
@@ -47,119 +48,228 @@ except ImportError:
 # ===========================================================================
 
 HOTKEY = "ctrl+space"
-OVERLAY_WIDTH = 400
-OVERLAY_HEIGHT = 150
-BG_COLOR = "#1e1e2e"
-FG_COLOR = "#cdd6f4"
-ACCENT_COLOR = "#89b4fa"
-ABORT_COLOR = "#f38ba8"
+OVERLAY_WIDTH = 440
+OVERLAY_HEIGHT = 300
+MIN_WIDTH = 320
+MIN_HEIGHT = 200
+
+# Catppuccin Mocha palette
+BG_COLOR      = "#1e1e2e"
+SURFACE_COLOR = "#313244"
+FG_COLOR      = "#cdd6f4"
+SUBTEXT_COLOR = "#6c7086"
+ACCENT_COLOR  = "#89b4fa"   # Blue
+GREEN_COLOR   = "#a6e3a1"   # Green (success)
+YELLOW_COLOR  = "#f9e2af"   # Yellow (running)
+RED_COLOR     = "#f38ba8"   # Red (error / abort)
+BORDER_COLOR  = "#45475a"
+
 
 # ===========================================================================
-# Overlay Window Class
+# Status States
+# ===========================================================================
+
+STATUS_IDLE    = ("idle",    "● Idle",    SUBTEXT_COLOR)
+STATUS_RUNNING = ("running", "● Running", YELLOW_COLOR)
+STATUS_DONE    = ("done",    "● Done",    GREEN_COLOR)
+STATUS_ERROR   = ("error",   "● Error",   RED_COLOR)
+STATUS_ABORTED = ("aborted", "● Aborted", RED_COLOR)
+
+
+# ===========================================================================
+# Overlay Window
 # ===========================================================================
 
 class OverlayWindow:
     def __init__(self):
-        # --- Root Setup ---
         self.root = tk.Tk()
         self.root.title("AI Agent Overlay")
         self.root.geometry(f"{OVERLAY_WIDTH}x{OVERLAY_HEIGHT}")
-        
-        # Make the window borderless, always-on-top, and slightly transparent
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.9)
-        self.root.configure(bg=BG_COLOR)
-        
-        # Center the window initially
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        x = (screen_width // 2) - (OVERLAY_WIDTH // 2)
-        y = (screen_height // 2) - (OVERLAY_HEIGHT // 2)
-        self.root.geometry(f"+{x}+{y}")
-        
-        # Variables for dragging
-        self._drag_start_x = 0
-        self._drag_start_y = 0
+        self.root.attributes("-alpha", 0.93)
+        self.root.configure(bg=BORDER_COLOR)  # 1px border effect via padding
 
-        # Agent thread control
+        # Center on screen
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = (sw - OVERLAY_WIDTH) // 2
+        y = (sh - OVERLAY_HEIGHT) // 2
+        self.root.geometry(f"+{x}+{y}")
+
+        # State
+        self.is_visible   = True
         self.agent_thread = None
-        self.agent_running = False
+        self.abort_event  = threading.Event()
+        self._history: list[str] = []
+        self._history_idx = -1
+        self._drag_x = self._drag_y = 0
+        self._resize_start = None
 
         self._build_ui()
-        
-        # Bind dragging events to the main frame
-        self.main_frame.bind("<Button-1>", self.start_drag)
-        self.main_frame.bind("<B1-Motion>", self.do_drag)
-        
-        # Bind global hotkey
-        keyboard.add_hotkey(HOTKEY, self.toggle_visibility)
-        
-        self.is_visible = True
+        self._log("Overlay ready. Enter a command to start.", tag="system")
+
+        keyboard.add_hotkey(HOTKEY, self._safe_toggle)
+
+    # -----------------------------------------------------------------------
+    # UI Construction
+    # -----------------------------------------------------------------------
 
     def _build_ui(self):
-        """Construct the UI elements inside the overlay."""
-        custom_font = tkfont.Font(family="Segoe UI", size=10)
-        title_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
-        
-        # Main container
-        self.main_frame = tk.Frame(self.root, bg=BG_COLOR, padx=10, pady=10)
-        self.main_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Top bar (Title and Drag handle)
-        self.top_bar = tk.Frame(self.main_frame, bg=BG_COLOR)
-        self.top_bar.pack(fill=tk.X, pady=(0, 10))
-        self.top_bar.bind("<Button-1>", self.start_drag)
-        self.top_bar.bind("<B1-Motion>", self.do_drag)
-        
-        self.title_label = tk.Label(self.top_bar, text="🤖 Setup Agent", font=title_font, bg=BG_COLOR, fg=ACCENT_COLOR)
-        self.title_label.pack(side=tk.LEFT)
-        
-        self.close_btn = tk.Button(self.top_bar, text="✖", bg=BG_COLOR, fg=FG_COLOR, borderwidth=0, activebackground=ABORT_COLOR, activeforeground="white", command=self.hide)
-        self.close_btn.pack(side=tk.RIGHT)
-        
-        # Status Label
-        self.status_var = tk.StringVar(value="Status: Idle (Awaiting command)")
-        self.status_label = tk.Label(self.main_frame, textvariable=self.status_var, font=custom_font, bg=BG_COLOR, fg=FG_COLOR, anchor="w")
-        self.status_label.pack(fill=tk.X, pady=(0, 5))
-        
-        # Input Frame
-        self.input_frame = tk.Frame(self.main_frame, bg=BG_COLOR)
-        self.input_frame.pack(fill=tk.X, pady=5)
-        
-        self.entry_var = tk.StringVar()
-        self.command_entry = tk.Entry(self.input_frame, textvariable=self.entry_var, font=custom_font, bg="#313244", fg=FG_COLOR, insertbackground=FG_COLOR, relief=tk.FLAT)
-        self.command_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=4, padx=(0, 5))
-        self.command_entry.bind("<Return>", lambda e: self.start_agent())
-        
-        # Buttons
-        self.btn_frame = tk.Frame(self.main_frame, bg=BG_COLOR)
-        self.btn_frame.pack(fill=tk.X, pady=(5, 0))
-        
-        self.run_btn = tk.Button(self.btn_frame, text="Run", bg=ACCENT_COLOR, fg="#11111b", font=custom_font, relief=tk.FLAT, command=self.start_agent)
-        self.run_btn.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
-        
-        self.abort_btn = tk.Button(self.btn_frame, text="Abort", bg=ABORT_COLOR, fg="#11111b", font=custom_font, relief=tk.FLAT, command=self.abort_agent)
-        self.abort_btn.pack(side=tk.LEFT, expand=True, fill=tk.X)
-        self.abort_btn.configure(state=tk.DISABLED)
+        mono  = tkfont.Font(family="Consolas",  size=9)
+        ui    = tkfont.Font(family="Segoe UI",  size=10)
+        title = tkfont.Font(family="Segoe UI",  size=11, weight="bold")
 
-    # --- Window Dragging Logic ---
-    def start_drag(self, event):
-        self._drag_start_x = event.x
-        self._drag_start_y = event.y
+        # Outer frame (sits on BG_COLOR border)
+        outer = tk.Frame(self.root, bg=BG_COLOR)
+        outer.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
-    def do_drag(self, event):
-        # Calculate how far the mouse has moved
-        x = self.root.winfo_x() - self._drag_start_x + event.x
-        y = self.root.winfo_y() - self._drag_start_y + event.y
-        self.root.geometry(f"+{x}+{y}")
+        # ── Top bar ─────────────────────────────────────────────────────────
+        bar = tk.Frame(outer, bg=BG_COLOR)
+        bar.pack(fill=tk.X, padx=10, pady=(8, 0))
 
-    # --- Visibility Toggle ---
-    def toggle_visibility(self):
-        if self.is_visible:
-            self.hide()
+        tk.Label(bar, text="🤖 Agent", font=title, bg=BG_COLOR,
+                 fg=ACCENT_COLOR).pack(side=tk.LEFT)
+
+        # Status indicator (right side of title bar)
+        self._status_var = tk.StringVar(value=STATUS_IDLE[1])
+        self._status_lbl = tk.Label(bar, textvariable=self._status_var,
+                                    font=ui, bg=BG_COLOR, fg=SUBTEXT_COLOR)
+        self._status_lbl.pack(side=tk.LEFT, padx=(8, 0))
+
+        # Close button
+        tk.Button(bar, text="✕", bg=BG_COLOR, fg=SUBTEXT_COLOR,
+                  activebackground=RED_COLOR, activeforeground=BG_COLOR,
+                  borderwidth=0, relief=tk.FLAT, cursor="hand2",
+                  command=self.hide).pack(side=tk.RIGHT)
+
+        # Make entire bar draggable
+        for widget in (bar, *bar.winfo_children()):
+            widget.bind("<Button-1>",   self._drag_start)
+            widget.bind("<B1-Motion>",  self._drag_move)
+
+        # ── Log area ────────────────────────────────────────────────────────
+        log_frame = tk.Frame(outer, bg=BG_COLOR)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(6, 0))
+
+        self._log_text = tk.Text(
+            log_frame, font=mono, bg=SURFACE_COLOR, fg=FG_COLOR,
+            insertbackground=FG_COLOR, relief=tk.FLAT,
+            wrap=tk.WORD, state=tk.DISABLED,
+            selectbackground=BORDER_COLOR,
+        )
+        scrollbar = tk.Scrollbar(log_frame, orient=tk.VERTICAL,
+                                  command=self._log_text.yview,
+                                  bg=SURFACE_COLOR, troughcolor=BG_COLOR,
+                                  activebackground=BORDER_COLOR,
+                                  relief=tk.FLAT, width=8)
+        self._log_text.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Tag styles for different log levels
+        self._log_text.tag_config("system",  foreground=SUBTEXT_COLOR)
+        self._log_text.tag_config("info",    foreground=FG_COLOR)
+        self._log_text.tag_config("success", foreground=GREEN_COLOR)
+        self._log_text.tag_config("error",   foreground=RED_COLOR)
+        self._log_text.tag_config("ts",      foreground=BORDER_COLOR)
+
+        # ── Input row ───────────────────────────────────────────────────────
+        input_row = tk.Frame(outer, bg=BG_COLOR)
+        input_row.pack(fill=tk.X, padx=10, pady=(6, 6))
+
+        self._entry_var = tk.StringVar()
+        self._entry = tk.Entry(
+            input_row, textvariable=self._entry_var,
+            font=ui, bg=SURFACE_COLOR, fg=FG_COLOR,
+            insertbackground=FG_COLOR, relief=tk.FLAT,
+            highlightthickness=1, highlightcolor=ACCENT_COLOR,
+            highlightbackground=BORDER_COLOR,
+        )
+        self._entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5,
+                         padx=(0, 6))
+        self._entry.bind("<Return>",   lambda _: self._start_agent())
+        self._entry.bind("<Up>",       self._history_prev)
+        self._entry.bind("<Down>",     self._history_next)
+        self._entry.focus_set()
+
+        btn_cfg = dict(font=ui, relief=tk.FLAT, cursor="hand2",
+                       padx=10, pady=4)
+
+        self._run_btn = tk.Button(
+            input_row, text="Run", bg=ACCENT_COLOR, fg=BG_COLOR,
+            activebackground=FG_COLOR, activeforeground=BG_COLOR,
+            command=self._start_agent, **btn_cfg)
+        self._run_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self._abort_btn = tk.Button(
+            input_row, text="Abort", bg=BORDER_COLOR, fg=SUBTEXT_COLOR,
+            activebackground=RED_COLOR, activeforeground=BG_COLOR,
+            command=self._abort_agent, state=tk.DISABLED, **btn_cfg)
+        self._abort_btn.pack(side=tk.LEFT)
+
+        # ── Resize grip (bottom-right corner) ───────────────────────────────
+        grip = tk.Label(outer, text="⠿", bg=BG_COLOR, fg=BORDER_COLOR,
+                        cursor="size_nw_se")
+        grip.pack(side=tk.RIGHT, anchor="se")
+        grip.bind("<Button-1>",  self._resize_start)
+        grip.bind("<B1-Motion>", self._resize_move)
+
+    # -----------------------------------------------------------------------
+    # Logging
+    # -----------------------------------------------------------------------
+
+    def _log(self, message: str, tag: str = "info"):
+        """Append a timestamped line to the log widget (thread-safe)."""
+        def _append():
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._log_text.configure(state=tk.NORMAL)
+            self._log_text.insert(tk.END, f"{ts}  ", "ts")
+            self._log_text.insert(tk.END, f"{message}\n", tag)
+            self._log_text.configure(state=tk.DISABLED)
+            self._log_text.see(tk.END)
+        self.root.after(0, _append)
+
+    def _set_status(self, state_tuple):
+        _, label, color = state_tuple
+        self.root.after(0, lambda: (
+            self._status_var.set(label),
+            self._status_lbl.configure(fg=color),
+        ))
+
+    # -----------------------------------------------------------------------
+    # Command History
+    # -----------------------------------------------------------------------
+
+    def _history_prev(self, _event):
+        if not self._history:
+            return
+        self._history_idx = max(0, self._history_idx - 1)
+        self._entry_var.set(self._history[self._history_idx])
+        self._entry.icursor(tk.END)
+
+    def _history_next(self, _event):
+        if not self._history:
+            return
+        if self._history_idx < len(self._history) - 1:
+            self._history_idx += 1
+            self._entry_var.set(self._history[self._history_idx])
         else:
-            self.show()
+            self._history_idx = len(self._history)
+            self._entry_var.set("")
+        self._entry.icursor(tk.END)
+
+    # -----------------------------------------------------------------------
+    # Visibility
+    # -----------------------------------------------------------------------
+
+    def _safe_toggle(self):
+        """Called from keyboard hotkey thread — must post to Tk main loop."""
+        self.root.after(0, self.toggle_visibility)
+
+    def toggle_visibility(self):
+        self.hide() if self.is_visible else self.show()
 
     def hide(self):
         self.root.withdraw()
@@ -167,95 +277,150 @@ class OverlayWindow:
 
     def show(self):
         self.root.deiconify()
-        # Bring to front
         self.root.attributes("-topmost", True)
-        self.command_entry.focus_set()
+        self._entry.focus_set()
         self.is_visible = True
 
-    # --- Agent Execution Logic ---
-    def update_status(self, msg: str):
-        """Thread-safe update of the status label."""
-        self.root.after(0, lambda: self.status_var.set(f"Status: {msg}"))
+    # -----------------------------------------------------------------------
+    # Dragging
+    # -----------------------------------------------------------------------
 
-    def start_agent(self):
-        if self.agent_running:
+    def _drag_start(self, event):
+        self._drag_x = event.x
+        self._drag_y = event.y
+
+    def _drag_move(self, event):
+        x = self.root.winfo_x() - self._drag_x + event.x
+        y = self.root.winfo_y() - self._drag_y + event.y
+        self.root.geometry(f"+{x}+{y}")
+
+    # -----------------------------------------------------------------------
+    # Resizing
+    # -----------------------------------------------------------------------
+
+    def _resize_start(self, event):
+        self._resize_start = (event.x_root, event.y_root,
+                              self.root.winfo_width(),
+                              self.root.winfo_height())
+
+    def _resize_move(self, event):
+        if not self._resize_start:
             return
-            
-        command = self.entry_var.get().strip()
+        ox, oy, ow, oh = self._resize_start
+        nw = max(MIN_WIDTH,  ow + event.x_root - ox)
+        nh = max(MIN_HEIGHT, oh + event.y_root - oy)
+        self.root.geometry(f"{nw}x{nh}")
+
+    # -----------------------------------------------------------------------
+    # Agent Execution
+    # -----------------------------------------------------------------------
+
+    def _start_agent(self):
+        if self._is_running():
+            return
+
+        command = self._entry_var.get().strip()
         if not command:
-            self.update_status("Please enter a command.")
+            self._log("Please enter a command.", tag="error")
             return
 
-        self.agent_running = True
-        self.run_btn.configure(state=tk.DISABLED)
-        self.abort_btn.configure(state=tk.NORMAL)
-        
-        # Start the agent in a background thread to prevent UI freezing
-        self.agent_thread = threading.Thread(target=self._run_agent_thread, args=(command,), daemon=True)
+        # Save to history (avoid consecutive duplicates)
+        if not self._history or self._history[-1] != command:
+            self._history.append(command)
+        self._history_idx = len(self._history)
+
+        self.abort_event.clear()
+        self._run_btn.configure(state=tk.DISABLED)
+        self._abort_btn.configure(state=tk.NORMAL,
+                                   bg=RED_COLOR, fg=BG_COLOR)
+        self._set_status(STATUS_RUNNING)
+        self._log(f"→ {command}", tag="info")
+
+        self.agent_thread = threading.Thread(
+            target=self._agent_thread_body,
+            args=(command,),
+            daemon=True,
+        )
         self.agent_thread.start()
 
-    def abort_agent(self):
-        if not self.agent_running:
+    def _abort_agent(self):
+        if not self._is_running():
             return
-            
-        self.update_status("Aborting agent...")
-        # Currently, a true hard abort of a background thread in Python is difficult
-        # without complex inter-thread messaging. We simulate an abort state.
-        self.agent_running = False
-        
-        # Reset UI
-        self._reset_ui()
-        self.update_status("Agent aborted by user.")
+        self.abort_event.set()
+        self._log("Abort requested…", tag="error")
+        self._set_status(STATUS_ABORTED)
+        self._reset_ui_state()
 
-    def _reset_ui(self):
-        self.run_btn.configure(state=tk.NORMAL)
-        self.abort_btn.configure(state=tk.DISABLED)
-        self.agent_running = False
+    def _is_running(self) -> bool:
+        return (self.agent_thread is not None
+                and self.agent_thread.is_alive())
 
-    def _run_agent_thread(self, command: str):
-        """The actual background task that runs the agent."""
+    def _reset_ui_state(self):
+        def _reset():
+            self._run_btn.configure(state=tk.NORMAL)
+            self._abort_btn.configure(state=tk.DISABLED,
+                                       bg=BORDER_COLOR, fg=SUBTEXT_COLOR)
+        self.root.after(0, _reset)
+
+    def _agent_thread_body(self, command: str):
+        """Background worker. Redirects stdout to the log panel."""
+
+        class _PipeToLog:
+            def __init__(self, log_fn):
+                self._log = log_fn
+                self._buf = ""
+
+            def write(self, text: str):
+                self._buf += text
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    line = line.strip()
+                    if line and not line.startswith("="):
+                        self._log(line)
+
+            def flush(self):
+                if self._buf.strip():
+                    self._log(self._buf.strip())
+                    self._buf = ""
+
+        original_stdout = sys.stdout
+        sys.stdout = _PipeToLog(self._log)
+
         try:
-            # We override print in this thread to intercept agent_graph.py logs
-            # and pipe them directly to our UI status!
-            class UILogger:
-                def __init__(self, update_func):
-                    self.update_func = update_func
-                    
-                def write(self, text):
-                    text = text.strip()
-                    if text and not text.startswith("="):
-                        self.update_func(text)
-                        
-                def flush(self):
-                    pass
-            
-            original_stdout = sys.stdout
-            sys.stdout = UILogger(self.update_status)
-            
-            try:
-                self.update_status(f"Starting agent: {command}")
-                if agent_graph:
-                    # In a real scenario, we might pass the command directly
-                    # For now, we assume the command is the app_name for Phase 4
-                    agent_graph.run_setup_agent(app_name=command)
-                else:
-                    # Mock behavior if agent_graph isn't found
-                    for i in range(1, 6):
-                        if not self.agent_running: break
-                        print(f"Executing step {i}/5...")
-                        time.sleep(1.5)
-                        
-                    if self.agent_running:
-                        print("✅ Setup complete!")
-                        
-            finally:
-                # Restore original stdout
-                sys.stdout = original_stdout
-                
-        except Exception as e:
-            self.update_status(f"Error: {e}")
+            if agent_graph:
+                agent_graph.run_setup_agent(
+                    app_name=command,
+                    abort_event=self.abort_event,   # pass if your graph supports it
+                )
+            else:
+                # ── Mock behaviour ──────────────────────────────────────────
+                steps = [
+                    "Resolving dependencies…",
+                    "Downloading packages…",
+                    "Running installer…",
+                    "Applying configuration…",
+                    "Verifying installation…",
+                ]
+                for i, step in enumerate(steps, 1):
+                    if self.abort_event.is_set():
+                        break
+                    print(f"[{i}/{len(steps)}] {step}")
+                    time.sleep(1.2)
+
+            if self.abort_event.is_set():
+                self._log("Agent stopped by user.", tag="error")
+                self._set_status(STATUS_ABORTED)
+            else:
+                self._log("✓ Done.", tag="success")
+                self._set_status(STATUS_DONE)
+
+        except Exception as exc:
+            self._log(f"Error: {exc}", tag="error")
+            self._set_status(STATUS_ERROR)
+
         finally:
-            self.root.after(0, self._reset_ui)
+            sys.stdout = original_stdout
+            self._reset_ui_state()
 
 
 # ===========================================================================
@@ -263,6 +428,6 @@ class OverlayWindow:
 # ===========================================================================
 
 if __name__ == "__main__":
-    print(f"Starting Overlay. Press {HOTKEY.upper()} to toggle visibility.")
+    print(f"Starting overlay. Press {HOTKEY.upper()} to toggle.")
     app = OverlayWindow()
     app.root.mainloop()
