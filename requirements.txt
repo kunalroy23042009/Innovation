@@ -19,5 +19,9 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 pypdf>=4.0.0         # PDF doc parsing (optional)
 
+# ── Terminal UI ────────────────────────────────────────────────────────────────
+rich>=13.7.0         # Progress bars, panels, tables, live display
+prompt_toolkit>=3.0.0  # Enhanced input with autocomplete
+
 # ── Utilities ──────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0 # Load GROQ_API_KEY from .env
