@@ -1,24 +1,17 @@
 """
-Installer.py — Real Software Installer
-========================================
-Detects OS and uses the appropriate package manager to install software.
+Installer.py — Dynamic AI-Powered Software Installer
+======================================================
+Installs virtually ANY software on Windows / Linux / macOS.
 
-Resolution strategy (in order):
-  1. Check alias map (known exact package IDs — fastest)
-  2. Live search on package manager (handles ANY app name)
-  3. pip install (Python packages)
-  4. Clear "not installable" message with manual download link
+How it works:
+  1. LLM normalizes the app name (fixes typos, slang, abbreviations)
+  2. Live package manager search finds the exact package ID dynamically
+  3. Tries every available package manager in order
+  4. pip for Python packages
+  5. Clear honest message with download link if nothing works
 
-Supported package managers:
-  Windows  → winget (primary) → chocolatey → pip
-  Linux    → apt (primary) → snap → pip
-  macOS    → brew cask → brew formula → pip
-
-Usage:
-  from Installer import install_software, is_installed, search_package
-
-  result = install_software("audacity")
-  print(result["success"], result["message"])
+NO hardcoded alias maps. Fully dynamic. Works for games, libraries,
+tools, CLI utilities — anything you can name (even if misspelled).
 """
 
 import subprocess
@@ -29,188 +22,29 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from llm_client import llm
+from logger import logger, log_step
 
 OS = platform.system()   # "Windows", "Linux", "Darwin"
 
 
-# ── Known alias maps (speed optimisation — not required for correctness) ───────
-# If an app is NOT in this map, the live search fallback will still find it.
-
-WINGET_ALIASES: dict[str, str] = {
-    "chrome": "Google.Chrome", "google chrome": "Google.Chrome",
-    "firefox": "Mozilla.Firefox", "edge": "Microsoft.Edge",
-    "brave": "Brave.Brave", "opera": "Opera.Opera",
-    "vscode": "Microsoft.VisualStudioCode", "vs code": "Microsoft.VisualStudioCode",
-    "visual studio code": "Microsoft.VisualStudioCode",
-    "git": "Git.Git", "github desktop": "GitHub.GitHubDesktop",
-    "nodejs": "OpenJS.NodeJS", "node": "OpenJS.NodeJS", "node.js": "OpenJS.NodeJS",
-    "python": "Python.Python.3", "python3": "Python.Python.3",
-    "java": "Oracle.JDK.21", "jdk": "Oracle.JDK.21", "jre": "Oracle.JavaRuntimeEnvironment",
-    "rust": "Rustlang.Rustup", "go": "GoLang.Go", "golang": "GoLang.Go",
-    "ruby": "RubyInstallerTeam.Ruby", "php": "PHP.PHP",
-    "postgresql": "PostgreSQL.PostgreSQL", "postgres": "PostgreSQL.PostgreSQL",
-    "mysql": "Oracle.MySQL", "mongodb": "MongoDB.Server",
-    "redis": "Redis.Redis", "sqlite": "SQLite.SQLite",
-    "pgadmin": "PostgreSQL.pgAdmin", "pgadmin4": "PostgreSQL.pgAdmin",
-    "discord": "Discord.Discord", "slack": "SlackTechnologies.Slack",
-    "zoom": "Zoom.Zoom", "teams": "Microsoft.Teams",
-    "telegram": "Telegram.TelegramDesktop", "whatsapp": "WhatsApp.WhatsApp",
-    "skype": "Microsoft.Skype", "signal": "OpenWhisperSystems.Signal",
-    "vlc": "VideoLAN.VLC", "spotify": "Spotify.Spotify",
-    "obs": "OBSProject.OBSStudio", "obs studio": "OBSProject.OBSStudio",
-    "audacity": "Audacity.Audacity", "handbrake": "HandBrake.HandBrake",
-    "gimp": "GIMP.GIMP", "inkscape": "Inkscape.Inkscape",
-    "blender": "BlenderFoundation.Blender", "krita": "KDE.Krita",
-    "kdenlive": "KDE.Kdenlive", "davinci resolve": "Blackmagic.DaVinciResolve",
-    "7zip": "7zip.7zip", "7-zip": "7zip.7zip",
-    "notepad++": "Notepad++.Notepad++", "winrar": "RARLab.WinRAR",
-    "putty": "PuTTY.PuTTY", "winscp": "WinSCP.WinSCP",
-    "filezilla": "TimKosse.FileZilla.Client",
-    "postman": "Postman.Postman", "insomnia": "Insomnia.Insomnia",
-    "docker": "Docker.DockerDesktop", "docker desktop": "Docker.DockerDesktop",
-    "virtualbox": "Oracle.VirtualBox", "vmware": "VMware.WorkstationPlayer",
-    "android studio": "Google.AndroidStudio",
-    "figma": "Figma.Figma", "notion": "Notion.Notion",
-    "obsidian": "Obsidian.Obsidian", "logseq": "Logseq.Logseq",
-    "1password": "AgileBits.1Password", "bitwarden": "Bitwarden.Bitwarden",
-    "keepass": "DominikReichl.KeePass",
-    "powertoys": "Microsoft.PowerToys",
-    "terminal": "Microsoft.WindowsTerminal", "windows terminal": "Microsoft.WindowsTerminal",
-    "cmake": "Kitware.CMake", "make": "GnuWin32.Make",
-    "ffmpeg": "Gyan.FFmpeg",
-    "tesseract": "UB-Mannheim.TesseractOCR",
-    "ollama": "Ollama.Ollama",
-    "wsl": "Microsoft.WSL", "wsl2": "Microsoft.WSL",
-    "nvidia": "Nvidia.GeForceExperience",
-    "steam": "Valve.Steam",
-    "tor browser": "TorProject.TorBrowser",
-    "libreoffice": "TheDocumentFoundation.LibreOffice",
-    "thunderbird": "Mozilla.Thunderbird",
-    "drawio": "JGraph.Draw",
-    "rufus": "Rufus.Rufus",
-    "etcher": "Balena.Etcher",
-    "cpu-z": "CPUID.CPU-Z", "gpu-z": "TechPowerUp.GPU-Z",
-    "hwinfo": "REALiX.HWiNFO",
-    "malwarebytes": "Malwarebytes.Malwarebytes",
-    "crystaldiskinfo": "CrystalDewWorld.CrystalDiskInfo",
-    "everything": "voidtools.Everything",
-    "powershell": "Microsoft.PowerShell",
-    "winget": "Microsoft.AppInstaller",
-    "nvm": "CoreyButler.NVMforWindows",
-    "yarn": "Yarn.Yarn",
-    "pnpm": "pnpm.pnpm",
-    "kubectl": "Kubernetes.kubectl",
-    "helm": "Helm.Helm",
-    "terraform": "Hashicorp.Terraform",
-    "awscli": "Amazon.AWSCLI",
-    "azure cli": "Microsoft.AzureCLI",
-    "gh": "GitHub.cli",
-    "github cli": "GitHub.cli",
-}
-
-APT_ALIASES: dict[str, str] = {
-    "chrome": "google-chrome-stable", "google chrome": "google-chrome-stable",
-    "firefox": "firefox", "brave": "brave-browser",
-    "vscode": "code", "vs code": "code", "visual studio code": "code",
-    "git": "git", "github desktop": "github-desktop",
-    "nodejs": "nodejs", "node": "nodejs",
-    "python": "python3", "python3": "python3",
-    "java": "default-jdk", "jdk": "default-jdk",
-    "rust": "rustup", "go": "golang", "golang": "golang",
-    "ruby": "ruby", "php": "php",
-    "postgresql": "postgresql", "postgres": "postgresql",
-    "mysql": "mysql-server", "mongodb": "mongodb",
-    "redis": "redis-server", "sqlite": "sqlite3",
-    "discord": "discord", "slack": "slack-desktop",
-    "zoom": "zoom", "skype": "skypeforlinux", "signal": "signal-desktop",
-    "telegram": "telegram-desktop",
-    "vlc": "vlc", "obs": "obs-studio", "obs studio": "obs-studio",
-    "audacity": "audacity", "handbrake": "handbrake",
-    "gimp": "gimp", "inkscape": "inkscape",
-    "blender": "blender", "krita": "krita", "kdenlive": "kdenlive",
-    "7zip": "p7zip-full", "7-zip": "p7zip-full",
-    "putty": "putty", "filezilla": "filezilla",
-    "postman": "postman",
-    "docker": "docker.io", "docker desktop": "docker.io",
-    "virtualbox": "virtualbox",
-    "libreoffice": "libreoffice",
-    "thunderbird": "thunderbird",
-    "curl": "curl", "wget": "wget",
-    "vim": "vim", "neovim": "neovim",
-    "htop": "htop", "tmux": "tmux",
-    "ffmpeg": "ffmpeg", "tesseract": "tesseract-ocr",
-    "ollama": "ollama",
-    "cmake": "cmake", "make": "make",
-    "gh": "gh", "github cli": "gh",
-    "kubectl": "kubectl",
-    "terraform": "terraform",
-    "awscli": "awscli",
-    "yarn": "yarn", "pnpm": "pnpm",
-}
-
-BREW_ALIASES: dict[str, str] = {
-    "chrome": "google-chrome", "google chrome": "google-chrome",
-    "firefox": "firefox", "brave": "brave-browser", "opera": "opera",
-    "vscode": "visual-studio-code", "vs code": "visual-studio-code",
-    "visual studio code": "visual-studio-code",
-    "git": "git", "github desktop": "github",
-    "nodejs": "node", "node": "node",
-    "python": "python", "python3": "python3",
-    "java": "openjdk", "jdk": "openjdk",
-    "rust": "rust", "go": "go", "golang": "go",
-    "ruby": "ruby", "php": "php",
-    "postgresql": "postgresql", "postgres": "postgresql",
-    "mysql": "mysql", "mongodb": "mongodb-community",
-    "redis": "redis", "sqlite": "sqlite",
-    "discord": "discord", "slack": "slack",
-    "zoom": "zoom", "skype": "skype", "signal": "signal",
-    "telegram": "telegram",
-    "vlc": "vlc", "obs": "obs", "obs studio": "obs",
-    "audacity": "audacity", "handbrake": "handbrake",
-    "gimp": "gimp", "inkscape": "inkscape",
-    "blender": "blender", "krita": "krita",
-    "7zip": "p7zip", "7-zip": "p7zip",
-    "postman": "postman", "insomnia": "insomnia",
-    "docker": "docker", "docker desktop": "docker",
-    "virtualbox": "virtualbox",
-    "figma": "figma", "notion": "notion",
-    "obsidian": "obsidian", "bitwarden": "bitwarden",
-    "libreoffice": "libreoffice",
-    "thunderbird": "thunderbird",
-    "curl": "curl", "wget": "wget",
-    "vim": "vim", "neovim": "neovim",
-    "htop": "htop", "tmux": "tmux",
-    "ffmpeg": "ffmpeg", "tesseract": "tesseract",
-    "ollama": "ollama",
-    "cmake": "cmake", "make": "make",
-    "gh": "gh", "github cli": "gh",
-    "kubectl": "kubectl",
-    "helm": "helm",
-    "terraform": "terraform",
-    "awscli": "awscli",
-    "yarn": "yarn", "pnpm": "pnpm",
-}
-
-# Apps that simply cannot be installed via any package manager
-UNINSTALLABLE: dict[str, str] = {
-    "xcode": "https://apps.apple.com/us/app/xcode/id497799835",
-    "ms office": "https://www.microsoft.com/en-us/microsoft-365",
-    "microsoft office": "https://www.microsoft.com/en-us/microsoft-365",
-    "word": "https://www.microsoft.com/en-us/microsoft-365",
-    "excel": "https://www.microsoft.com/en-us/microsoft-365",
-    "powerpoint": "https://www.microsoft.com/en-us/microsoft-365",
-    "adobe photoshop": "https://www.adobe.com/products/photoshop.html",
-    "photoshop": "https://www.adobe.com/products/photoshop.html",
-    "adobe premiere": "https://www.adobe.com/products/premiere.html",
-    "premiere pro": "https://www.adobe.com/products/premiere.html",
-    "after effects": "https://www.adobe.com/products/aftereffects.html",
-    "adobe illustrator": "https://www.adobe.com/products/illustrator.html",
-    "illustrator": "https://www.adobe.com/products/illustrator.html",
-    "final cut pro": "https://www.apple.com/final-cut-pro/",
-    "ios": "Cannot install iOS on a PC.",
-    "android": "Use Android Studio's emulator or install via your phone.",
-    "macos": "macOS can only be installed on Apple hardware.",
-    "windows": "Windows must be installed from official installation media: https://www.microsoft.com/en-us/software-download/windows11",
+# ── Apps that genuinely cannot be auto-installed anywhere ─────────────────────
+# Only truly impossible ones — paid/proprietary with no CLI installer.
+TRULY_UNINSTALLABLE = {
+    "xcode":               "https://apps.apple.com/us/app/xcode/id497799835",
+    "microsoft office":    "https://www.microsoft.com/en-us/microsoft-365",
+    "ms office":           "https://www.microsoft.com/en-us/microsoft-365",
+    "adobe photoshop":     "https://www.adobe.com/products/photoshop.html",
+    "photoshop":           "https://www.adobe.com/products/photoshop.html",
+    "adobe premiere":      "https://www.adobe.com/products/premiere.html",
+    "premiere pro":        "https://www.adobe.com/products/premiere.html",
+    "after effects":       "https://www.adobe.com/products/aftereffects.html",
+    "adobe illustrator":   "https://www.adobe.com/products/illustrator.html",
+    "final cut pro":       "https://www.apple.com/final-cut-pro/",
+    "logic pro":           "https://www.apple.com/logic-pro/",
+    "ios":                 "iOS runs on Apple devices only — cannot be installed on a PC.",
+    "macos":               "macOS can only run on Apple hardware.",
+    "windows":             "https://www.microsoft.com/en-us/software-download/windows11",
 }
 
 
@@ -220,8 +54,9 @@ UNINSTALLABLE: dict[str, str] = {
 class InstallResult:
     success:           bool
     app_name:          str
-    package_id:        str
-    method:            str
+    resolved_name:     str        # LLM-corrected canonical name
+    package_id:        str        # actual package manager ID used
+    method:            str        # which package manager succeeded
     message:           str
     already_installed: bool = False
     output:            str  = ""
@@ -231,6 +66,7 @@ class InstallResult:
         return {
             "success":           self.success,
             "app_name":          self.app_name,
+            "resolved_name":     self.resolved_name,
             "package_id":        self.package_id,
             "method":            self.method,
             "message":           self.message,
@@ -240,9 +76,10 @@ class InstallResult:
         }
 
 
-# ── Subprocess helpers ─────────────────────────────────────────────────────────
+# ── Subprocess runner ──────────────────────────────────────────────────────────
 
 def _run(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
+    """Run a command, stream output live, return (returncode, stdout, stderr)."""
     print(f"    $ {' '.join(cmd)}")
     try:
         proc = subprocess.Popen(
@@ -270,14 +107,79 @@ def _cmd_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-def _normalize(name: str) -> str:
-    return name.strip().lower()
+# ── LLM name resolver ──────────────────────────────────────────────────────────
+
+def _resolve_app_name(raw_input: str) -> dict:
+    """
+    Use the LLM (Groq → Ollama fallback) to:
+      - Fix typos and abbreviations
+      - Return the canonical app name + best search query for each OS package manager
+      - Detect if it's a Python package (pip)
+      - Detect if it's uninstallable
+
+    Returns a dict with keys:
+      canonical_name, winget_query, apt_query, brew_query,
+      pip_name, is_python_package, is_uninstallable, uninstallable_reason
+    """
+    prompt = f"""You are a software installation assistant with deep knowledge of package managers.
+
+The user wants to install: "{raw_input}"
+
+This may contain typos, abbreviations, or informal names. Your job is to identify what they actually want and provide the best search query for each package manager.
+
+Return ONLY a valid JSON object with these exact keys:
+{{
+  "canonical_name": "The correct, full name of the software (e.g. 'Visual Studio Code', 'VLC Media Player')",
+  "winget_query": "Best search term for Windows winget (e.g. 'Microsoft.VisualStudioCode' or 'VLC')",
+  "apt_query": "Best package name for Linux apt-get (e.g. 'code' or 'vlc')",
+  "brew_query": "Best formula/cask name for macOS Homebrew (e.g. 'visual-studio-code' or 'vlc')",
+  "pip_name": "PyPI package name if this is a Python library (e.g. 'numpy'), else empty string",
+  "is_python_package": true or false,
+  "is_uninstallable": true or false,
+  "uninstallable_reason": "If truly uninstallable (e.g. paid app, OS-specific), explain why and give the official download URL. Else empty string.",
+  "category": "one of: browser, game, media, dev_tool, database, communication, utility, python_library, system_tool, other"
+}}
+
+Examples:
+- "vscoed" → canonical_name: "Visual Studio Code", winget_query: "Microsoft.VisualStudioCode"
+- "discrod" → canonical_name: "Discord", winget_query: "Discord.Discord"
+- "numpay" → canonical_name: "NumPy", pip_name: "numpy", is_python_package: true
+- "photoshoop" → canonical_name: "Adobe Photoshop", is_uninstallable: true
+- "gta 5" → canonical_name: "Grand Theft Auto V", winget_query: "Rockstar.GTA5", uninstallable_reason: "GTA V requires purchase on Steam/Epic. Get it at: https://store.steampowered.com/app/271590"
+- "mincraft" → canonical_name: "Minecraft", winget_query: "Mojang.Minecraft"
+- "fortnit" → canonical_name: "Fortnite", winget_query: "EpicGames.EpicGamesLauncher"
+
+No markdown. No explanation. Only JSON."""
+
+    try:
+        raw = llm.chat(prompt, fast=False)
+        # Strip markdown fences if present
+        raw = raw.strip()
+        if "```json" in raw:
+            raw = raw.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw:
+            raw = raw.split("```")[1].split("```")[0].strip()
+        result = __import__("json").loads(raw)
+        return result
+    except Exception as exc:
+        logger.warning(f"LLM name resolution failed: {exc}. Using raw input.")
+        return {
+            "canonical_name": raw_input,
+            "winget_query": raw_input,
+            "apt_query": raw_input.lower().replace(" ", "-"),
+            "brew_query": raw_input.lower().replace(" ", "-"),
+            "pip_name": raw_input.lower().replace(" ", "-"),
+            "is_python_package": False,
+            "is_uninstallable": False,
+            "uninstallable_reason": "",
+            "category": "other",
+        }
 
 
-# ── Live search helpers ────────────────────────────────────────────────────────
+# ── Dynamic package manager search ────────────────────────────────────────────
 
-def _winget_search(query: str) -> Optional[str]:
-    """Search winget and return the best matching package ID, or None."""
+def _winget_find_best(query: str) -> Optional[str]:
+    """Search winget and return the single best package ID."""
     rc, out, _ = _run(
         ["winget", "search", query, "--accept-source-agreements", "--limit", "5"],
         timeout=30,
@@ -285,68 +187,473 @@ def _winget_search(query: str) -> Optional[str]:
     if rc != 0 or not out.strip():
         return None
 
-    lines = [l for l in out.splitlines() if l.strip() and not l.startswith("-")]
-    # Skip header lines (Name / Id / Version / Match / Source)
-    data_lines = []
+    # Parse: skip header and separator lines, grab first data row's ID column
     header_passed = False
-    for line in lines:
-        if re.match(r"^-+", line):
+    for line in out.splitlines():
+        if re.match(r"^[-\s]+$", line):
             header_passed = True
             continue
         if header_passed and line.strip():
-            data_lines.append(line)
+            # winget output columns: Name   Id   Version   Match   Source
+            # ID is the second token that looks like Publisher.App
+            parts = line.split()
+            for part in parts:
+                if "." in part and len(part) > 3:
+                    return part  # this is the package ID
+    return None
 
-    if not data_lines:
+
+def _apt_find_best(query: str) -> Optional[str]:
+    """Search apt and return the best matching package name."""
+    # Exact match first
+    rc, out, _ = _run(["apt-cache", "search", f"^{query}$"], timeout=15)
+    if rc == 0 and out.strip():
+        return out.splitlines()[0].split()[0]
+    # Broad search
+    rc, out, _ = _run(["apt-cache", "search", query], timeout=15)
+    if rc == 0 and out.strip():
+        return out.splitlines()[0].split(" - ")[0].strip()
+    return None
+
+
+def _brew_find_best(query: str) -> Optional[tuple[str, bool]]:
+    """
+    Search brew and return (package_name, is_cask).
+    Prefers casks (GUI apps) over formulae.
+    """
+    rc, out, _ = _run(["brew", "search", query], timeout=20)
+    if rc != 0 or not out.strip():
         return None
 
-    # First result — extract the Id column (second column)
-    parts = data_lines[0].split()
-    if len(parts) >= 2:
-        return parts[1]   # winget ID e.g. "VideoLAN.VLC"
-    return None
+    casks = []
+    formulae = []
+    in_casks = False
 
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "Casks" in line:
+            in_casks = True
+            continue
+        if "Formulae" in line:
+            in_casks = False
+            continue
+        if in_casks:
+            casks.append(line)
+        else:
+            formulae.append(line)
 
-def _apt_search(query: str) -> Optional[str]:
-    """Search apt-cache and return the best matching package name, or None."""
-    rc, out, _ = _run(["apt-cache", "search", "--names-only", query], timeout=20)
-    if rc != 0 or not out.strip():
-        # broader search
-        rc, out, _ = _run(["apt-cache", "search", query], timeout=20)
-    if rc == 0 and out.strip():
-        first_line = out.splitlines()[0]
-        return first_line.split(" - ")[0].strip()
-    return None
-
-
-def _brew_search(query: str) -> Optional[str]:
-    """Search brew and return the best matching formula/cask name, or None."""
-    rc, out, _ = _run(["brew", "search", query], timeout=20)
-    if rc == 0 and out.strip():
-        # Prefer casks (GUI apps) over formulae
-        lines = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("=")]
-        if lines:
-            return lines[0]
+    if casks:
+        return casks[0], True
+    if formulae:
+        return formulae[0], False
     return None
 
 
 # ── Already-installed check ────────────────────────────────────────────────────
 
-def is_installed(app_name: str) -> bool:
-    key = _normalize(app_name)
+def is_installed(canonical_name: str, pip_name: str = "") -> bool:
+    """Check if software is already installed."""
+    key = canonical_name.lower()
+
+    # Common binary names
     binary_map = {
         "git": "git", "node": "node", "nodejs": "node",
-        "python": "python", "python3": "python3",
-        "postgresql": "psql", "postgres": "psql",
-        "mysql": "mysql", "redis": "redis-cli",
-        "docker": "docker", "vim": "vim", "neovim": "nvim",
-        "curl": "curl", "wget": "wget", "htop": "htop",
-        "tmux": "tmux", "ffmpeg": "ffmpeg",
-        "ollama": "ollama", "gh": "gh",
-        "kubectl": "kubectl", "terraform": "terraform",
+        "python": "python3", "python3": "python3",
+        "postgresql": "psql", "mysql": "mysql",
+        "redis": "redis-cli", "docker": "docker",
+        "vim": "vim", "neovim": "nvim",
+        "curl": "curl", "wget": "wget",
+        "ffmpeg": "ffmpeg", "ollama": "ollama",
+        "gh": "gh", "kubectl": "kubectl",
+        "terraform": "terraform", "go": "go",
+        "rust": "rustc", "ruby": "ruby", "php": "php",
     }
     binary = binary_map.get(key)
     if binary and _cmd_exists(binary):
         return True
+
+    # pip check
+    if pip_name:
+        rc, out, _ = _run(
+            [sys.executable, "-m", "pip", "show", pip_name], timeout=10
+        )
+        if rc == 0:
+            return True
+
+    # winget list
+    if OS == "Windows" and _cmd_exists("winget"):
+        rc, out, _ = _run(
+            ["winget", "list", "--name", canonical_name,
+             "--accept-source-agreements"],
+            timeout=30,
+        )
+        if rc == 0 and canonical_name.lower() in out.lower():
+            return True
+
+    return False
+
+
+# ── OS-specific install functions ──────────────────────────────────────────────
+
+def _install_windows(app_name: str, resolved: dict) -> InstallResult:
+    canonical = resolved["canonical_name"]
+    winget_q  = resolved["winget_query"]
+    pip_name  = resolved["pip_name"]
+    is_py     = resolved["is_python_package"]
+
+    # ── Truly uninstallable ───────────────────────────────────────────────────
+    if resolved["is_uninstallable"]:
+        reason = resolved["uninstallable_reason"]
+        url_match = re.search(r"https?://\S+", reason)
+        url = url_match.group(0) if url_match else ""
+        return InstallResult(
+            success=False, app_name=app_name, resolved_name=canonical,
+            package_id="", method="none",
+            message=(
+                f"⚠️  '{canonical}' cannot be installed automatically.\n"
+                f"   {reason}"
+            ),
+            download_url=url,
+        )
+
+    # ── Already installed? ────────────────────────────────────────────────────
+    if is_installed(canonical, pip_name):
+        return InstallResult(
+            success=True, app_name=app_name, resolved_name=canonical,
+            package_id=canonical, method="already_installed",
+            already_installed=True,
+            message=f"✅ '{canonical}' is already installed.",
+        )
+
+    # ── Python package (pip first) ────────────────────────────────────────────
+    if is_py and pip_name:
+        log_step("🐍", f"Installing Python package via pip: {pip_name}")
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", pip_name])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pip_name, method="pip",
+                message=f"✅ Installed '{canonical}' via pip.", output=out,
+            )
+
+    # ── winget ────────────────────────────────────────────────────────────────
+    if _cmd_exists("winget"):
+        # First try the LLM-suggested query directly
+        log_step("🔍", f"Searching winget for: {winget_q}")
+        package_id = _winget_find_best(winget_q) or winget_q
+
+        log_step("📦", f"winget installing: {package_id}")
+        rc, out, err = _run([
+            "winget", "install", "--id", package_id, "-e",
+            "--accept-package-agreements", "--accept-source-agreements",
+        ])
+        if rc == 0 or "already installed" in (out + err).lower():
+            already = "already installed" in (out + err).lower()
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=package_id, method="winget",
+                already_installed=already,
+                message=f"✅ {'Already installed' if already else 'Installed'}: '{canonical}' via winget.",
+                output=out,
+            )
+
+        # If that failed, try searching with canonical name
+        if winget_q != canonical:
+            log_step("🔍", f"Retrying winget search with canonical name: {canonical}")
+            package_id2 = _winget_find_best(canonical)
+            if package_id2 and package_id2 != package_id:
+                rc, out, err = _run([
+                    "winget", "install", "--id", package_id2, "-e",
+                    "--accept-package-agreements", "--accept-source-agreements",
+                ])
+                if rc == 0:
+                    return InstallResult(
+                        success=True, app_name=app_name, resolved_name=canonical,
+                        package_id=package_id2, method="winget",
+                        message=f"✅ Installed '{canonical}' via winget.",
+                        output=out,
+                    )
+
+    # ── chocolatey fallback ────────────────────────────────────────────────────
+    if _cmd_exists("choco"):
+        choco_q = canonical.lower().replace(" ", "-")
+        log_step("🍫", f"Trying chocolatey: {choco_q}")
+        rc, out, err = _run(["choco", "install", choco_q, "-y"])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=choco_q, method="chocolatey",
+                message=f"✅ Installed '{canonical}' via chocolatey.", output=out,
+            )
+
+    # ── pip fallback (even for non-Python apps — sometimes works) ─────────────
+    if pip_name:
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", pip_name])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pip_name, method="pip",
+                message=f"✅ Installed '{canonical}' via pip.", output=out,
+            )
+
+    # ── Nothing worked ────────────────────────────────────────────────────────
+    return _failure(app_name, canonical, "winget/choco/pip")
+
+
+def _install_linux(app_name: str, resolved: dict) -> InstallResult:
+    canonical = resolved["canonical_name"]
+    apt_q     = resolved["apt_query"]
+    pip_name  = resolved["pip_name"]
+    is_py     = resolved["is_python_package"]
+
+    if resolved["is_uninstallable"]:
+        reason = resolved["uninstallable_reason"]
+        url_match = re.search(r"https?://\S+", reason)
+        return InstallResult(
+            success=False, app_name=app_name, resolved_name=canonical,
+            package_id="", method="none",
+            message=f"⚠️  '{canonical}' cannot be auto-installed.\n   {reason}",
+            download_url=url_match.group(0) if url_match else "",
+        )
+
+    if is_installed(canonical, pip_name):
+        return InstallResult(
+            success=True, app_name=app_name, resolved_name=canonical,
+            package_id=canonical, method="already_installed",
+            already_installed=True,
+            message=f"✅ '{canonical}' is already installed.",
+        )
+
+    if is_py and pip_name:
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", pip_name])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pip_name, method="pip",
+                message=f"✅ Installed '{canonical}' via pip.", output=out,
+            )
+
+    # ── apt ───────────────────────────────────────────────────────────────────
+    if _cmd_exists("apt"):
+        _run(["sudo", "apt", "update", "-qq"], timeout=60)
+        pkg = _apt_find_best(apt_q) or apt_q
+        log_step("📦", f"apt installing: {pkg}")
+        rc, out, err = _run(["sudo", "apt", "install", "-y", pkg], timeout=300)
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pkg, method="apt",
+                message=f"✅ Installed '{canonical}' via apt.", output=out,
+            )
+
+    # ── snap ──────────────────────────────────────────────────────────────────
+    if _cmd_exists("snap"):
+        snap_q = canonical.lower().replace(" ", "-")
+        for snap_cmd in [
+            ["sudo", "snap", "install", snap_q],
+            ["sudo", "snap", "install", snap_q, "--classic"],
+        ]:
+            rc, out, err = _run(snap_cmd, timeout=300)
+            if rc == 0:
+                return InstallResult(
+                    success=True, app_name=app_name, resolved_name=canonical,
+                    package_id=snap_q, method="snap",
+                    message=f"✅ Installed '{canonical}' via snap.", output=out,
+                )
+
+    # ── flatpak ───────────────────────────────────────────────────────────────
+    if _cmd_exists("flatpak"):
+        flatpak_q = canonical.lower().replace(" ", "-")
+        rc, out, err = _run(
+            ["flatpak", "install", "-y", "flathub", flatpak_q], timeout=300
+        )
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=flatpak_q, method="flatpak",
+                message=f"✅ Installed '{canonical}' via flatpak.", output=out,
+            )
+
+    # ── pip ───────────────────────────────────────────────────────────────────
+    if pip_name:
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", pip_name])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pip_name, method="pip",
+                message=f"✅ Installed '{canonical}' via pip.", output=out,
+            )
+
+    return _failure(app_name, canonical, "apt/snap/flatpak/pip")
+
+
+def _install_macos(app_name: str, resolved: dict) -> InstallResult:
+    canonical = resolved["canonical_name"]
+    brew_q    = resolved["brew_query"]
+    pip_name  = resolved["pip_name"]
+    is_py     = resolved["is_python_package"]
+
+    if resolved["is_uninstallable"]:
+        reason = resolved["uninstallable_reason"]
+        url_match = re.search(r"https?://\S+", reason)
+        return InstallResult(
+            success=False, app_name=app_name, resolved_name=canonical,
+            package_id="", method="none",
+            message=f"⚠️  '{canonical}' cannot be auto-installed.\n   {reason}",
+            download_url=url_match.group(0) if url_match else "",
+        )
+
+    if is_installed(canonical, pip_name):
+        return InstallResult(
+            success=True, app_name=app_name, resolved_name=canonical,
+            package_id=canonical, method="already_installed",
+            already_installed=True,
+            message=f"✅ '{canonical}' is already installed.",
+        )
+
+    if is_py and pip_name:
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", pip_name])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pip_name, method="pip",
+                message=f"✅ Installed '{canonical}' via pip.", output=out,
+            )
+
+    # ── brew ──────────────────────────────────────────────────────────────────
+    if _cmd_exists("brew"):
+        brew_result = _brew_find_best(brew_q)
+        if brew_result:
+            pkg, is_cask = brew_result
+        else:
+            pkg, is_cask = brew_q, True  # default: try as cask
+
+        # cask first
+        cmd = ["brew", "install", "--cask", pkg] if is_cask else ["brew", "install", pkg]
+        log_step("📦", f"brew installing: {pkg} ({'cask' if is_cask else 'formula'})")
+        rc, out, err = _run(cmd, timeout=300)
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pkg, method=f"brew {'cask' if is_cask else 'formula'}",
+                message=f"✅ Installed '{canonical}' via brew.", output=out,
+            )
+
+        # try the other (formula if cask failed, or cask if formula failed)
+        alt_cmd = ["brew", "install", pkg] if is_cask else ["brew", "install", "--cask", pkg]
+        rc, out, err = _run(alt_cmd, timeout=300)
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pkg, method="brew",
+                message=f"✅ Installed '{canonical}' via brew.", output=out,
+            )
+
+    if pip_name:
+        rc, out, err = _run([sys.executable, "-m", "pip", "install", pip_name])
+        if rc == 0:
+            return InstallResult(
+                success=True, app_name=app_name, resolved_name=canonical,
+                package_id=pip_name, method="pip",
+                message=f"✅ Installed '{canonical}' via pip.", output=out,
+            )
+
+    return _failure(app_name, canonical, "brew/pip")
+
+
+# ── Failure builder ────────────────────────────────────────────────────────────
+
+def _failure(app_name: str, canonical: str, tried: str) -> InstallResult:
+    """Build a helpful, honest failure message with a manual download link."""
+    search_urls = {
+        "Windows": f"https://winstall.app/search?q={canonical.replace(' ', '+')}",
+        "Linux":   f"https://repology.org/projects/?search={canonical.replace(' ', '+')}",
+        "Darwin":  f"https://formulae.brew.sh/cask/",
+    }
+    url = search_urls.get(OS, f"https://google.com/search?q=install+{canonical.replace(' ', '+')}")
+    return InstallResult(
+        success=False, app_name=app_name, resolved_name=canonical,
+        package_id="", method="none",
+        message=(
+            f"⚠️  Could not install '{canonical}' automatically via {tried}.\n"
+            f"   This could mean:\n"
+            f"   • The software requires a paid license or account\n"
+            f"   • It's platform-specific (not available on {OS})\n"
+            f"   • It needs manual installer steps\n\n"
+            f"   👉 Find it manually: {url}"
+        ),
+        download_url=url,
+    )
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
+
+def install_software(app_name: str) -> dict:
+    """
+    Install any software by name — handles typos, slang, abbreviations.
+
+    Steps:
+      1. LLM resolves the name (fixes typos, identifies package IDs)
+      2. Live package manager search
+      3. Fallback chain across all available package managers
+      4. Honest failure with manual download link
+
+    Returns: dict with success, resolved_name, method, message, download_url
+    """
+    print(f"\n  📦 Resolving: '{app_name}'  (OS: {OS})")
+
+    # Step 1: LLM resolves name + package IDs
+    log_step("🧠", f"LLM resolving '{app_name}'…")
+    resolved = _resolve_app_name(app_name)
+    canonical = resolved.get("canonical_name", app_name)
+
+    if canonical != app_name:
+        log_step("✏️ ", f"Resolved '{app_name}' → '{canonical}'")
+
+    # Step 2: Install via OS-specific chain
+    if OS == "Windows":
+        result = _install_windows(app_name, resolved)
+    elif OS == "Linux":
+        result = _install_linux(app_name, resolved)
+    elif OS == "Darwin":
+        result = _install_macos(app_name, resolved)
+    else:
+        result = InstallResult(
+            success=False, app_name=app_name, resolved_name=canonical,
+            package_id="", method="none",
+            message=f"❌ Unsupported OS: {OS}. Please install '{canonical}' manually.",
+        )
+
+    icon = "✅" if result.success else "⚠️ "
+    print(f"\n  {icon} {result.message}")
+    return result.to_dict()
+
+
+def is_installed(app_name: str, pip_name: str = "") -> bool:
+    """Quick check: is this software already present on the machine?"""
+    key = app_name.lower()
+    binary_map = {
+        "git": "git", "node": "node", "nodejs": "node",
+        "python": "python3", "python3": "python3",
+        "postgresql": "psql", "mysql": "mysql",
+        "redis": "redis-cli", "docker": "docker",
+        "vim": "vim", "neovim": "nvim",
+        "curl": "curl", "wget": "wget",
+        "ffmpeg": "ffmpeg", "ollama": "ollama",
+        "gh": "gh", "kubectl": "kubectl",
+        "go": "go", "rust": "rustc",
+        "ruby": "ruby", "php": "php",
+    }
+    binary = binary_map.get(key)
+    if binary and _cmd_exists(binary):
+        return True
+
+    if pip_name:
+        rc, _, _ = _run([sys.executable, "-m", "pip", "show", pip_name], timeout=10)
+        if rc == 0:
+            return True
 
     if OS == "Windows" and _cmd_exists("winget"):
         rc, out, _ = _run(
@@ -359,339 +666,30 @@ def is_installed(app_name: str) -> bool:
     return False
 
 
-# ── Package search (public) ────────────────────────────────────────────────────
-
 def search_package(app_name: str) -> list[str]:
-    """Return matching package names from the OS package manager."""
+    """Return matching package names (used for suggestions in main.py)."""
     results: list[str] = []
-
     if OS == "Windows" and _cmd_exists("winget"):
         rc, out, _ = _run(
-            ["winget", "search", app_name, "--accept-source-agreements"],
-            timeout=30,
+            ["winget", "search", app_name, "--accept-source-agreements"], timeout=30
         )
         if rc == 0:
             header_passed = False
             for line in out.splitlines():
-                if re.match(r"^-+", line):
+                if re.match(r"^[-\s]+$", line):
                     header_passed = True
                     continue
                 if header_passed and line.strip():
                     parts = line.split()
                     if len(parts) >= 2:
                         results.append(parts[1])
-
     elif OS == "Linux" and _cmd_exists("apt-cache"):
         rc, out, _ = _run(["apt-cache", "search", app_name], timeout=20)
         if rc == 0:
             for line in out.splitlines():
                 results.append(line.split(" - ")[0].strip())
-
     elif OS == "Darwin" and _cmd_exists("brew"):
         rc, out, _ = _run(["brew", "search", app_name], timeout=20)
         if rc == 0:
             results = [l.strip() for l in out.splitlines() if l.strip() and not l.startswith("=")]
-
     return results[:10]
-
-
-# ── Core install logic ─────────────────────────────────────────────────────────
-
-def _resolve_winget_id(key: str, app_name: str) -> str:
-    """Return a winget package ID: alias map first, live search fallback."""
-    if key in WINGET_ALIASES:
-        return WINGET_ALIASES[key]
-    # Live search
-    found = _winget_search(app_name)
-    return found or app_name   # last resort: pass raw name and let winget try
-
-
-def _resolve_apt_pkg(key: str, app_name: str) -> str:
-    if key in APT_ALIASES:
-        return APT_ALIASES[key]
-    found = _apt_search(app_name)
-    return found or key
-
-
-def _resolve_brew_pkg(key: str, app_name: str) -> str:
-    if key in BREW_ALIASES:
-        return BREW_ALIASES[key]
-    found = _brew_search(app_name)
-    return found or key
-
-
-def _install_windows(app_name: str) -> InstallResult:
-    key = _normalize(app_name)
-
-    # ── Uninstallable check ───────────────────────────────────────────────────
-    if key in UNINSTALLABLE:
-        url = UNINSTALLABLE[key]
-        return InstallResult(
-            success=False, app_name=app_name, package_id=key, method="none",
-            message=(
-                f"⚠️  '{app_name}' cannot be installed automatically via a package manager.\n"
-                f"   Please download and install it manually from:\n   {url}"
-            ),
-            download_url=url,
-        )
-
-    # ── Already installed? ────────────────────────────────────────────────────
-    if is_installed(app_name):
-        return InstallResult(
-            success=True, app_name=app_name, package_id=key,
-            method="already_installed", already_installed=True,
-            message=f"'{app_name}' is already installed.",
-        )
-
-    # ── winget ────────────────────────────────────────────────────────────────
-    if _cmd_exists("winget"):
-        package_id = _resolve_winget_id(key, app_name)
-        print(f"  [winget] Trying: {package_id}")
-        rc, out, err = _run([
-            "winget", "install", "--id", package_id, "-e",
-            "--accept-package-agreements", "--accept-source-agreements",
-        ])
-        if rc == 0 or "already installed" in out.lower():
-            already = "already installed" in out.lower()
-            return InstallResult(
-                success=True, app_name=app_name, package_id=package_id,
-                method="winget", already_installed=already,
-                message=f"✅ {'Already installed' if already else 'Installed'}: '{app_name}' via winget.",
-                output=out,
-            )
-
-        # winget search fallback — try first search result if alias didn't work
-        if key not in WINGET_ALIASES:
-            searched = _winget_search(app_name)
-            if searched and searched != package_id:
-                print(f"  [winget] Retrying with search result: {searched}")
-                rc, out, err = _run([
-                    "winget", "install", "--id", searched, "-e",
-                    "--accept-package-agreements", "--accept-source-agreements",
-                ])
-                if rc == 0:
-                    return InstallResult(
-                        success=True, app_name=app_name, package_id=searched,
-                        method="winget",
-                        message=f"✅ Installed '{app_name}' via winget (search: {searched}).",
-                        output=out,
-                    )
-
-    # ── chocolatey fallback ────────────────────────────────────────────────────
-    if _cmd_exists("choco"):
-        print(f"  [choco] Trying: {key}")
-        rc, out, err = _run(["choco", "install", key, "-y"])
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=key,
-                method="chocolatey",
-                message=f"✅ Installed '{app_name}' via chocolatey.",
-                output=out,
-            )
-
-    # ── pip fallback (Python packages) ────────────────────────────────────────
-    rc, out, err = _run([sys.executable, "-m", "pip", "install", key])
-    if rc == 0:
-        return InstallResult(
-            success=True, app_name=app_name, package_id=key,
-            method="pip",
-            message=f"✅ Installed '{app_name}' as a Python package via pip.",
-            output=out,
-        )
-
-    # ── Nothing worked ────────────────────────────────────────────────────────
-    suggestions = search_package(app_name)
-    suggestion_text = ""
-    if suggestions:
-        suggestion_text = f"\n   Did you mean one of these? {', '.join(suggestions[:3])}"
-
-    return InstallResult(
-        success=False, app_name=app_name, package_id=key,
-        method="none",
-        message=(
-            f"⚠️  Could not install '{app_name}' automatically.\n"
-            f"   It may not be available in any package manager, or the name may be misspelled.{suggestion_text}\n"
-            f"   Try searching manually: https://winstall.app/search?q={app_name.replace(' ', '+')}"
-        ),
-        download_url=f"https://winstall.app/search?q={app_name.replace(' ', '+')}",
-    )
-
-
-def _install_linux(app_name: str) -> InstallResult:
-    key = _normalize(app_name)
-
-    if key in UNINSTALLABLE:
-        url = UNINSTALLABLE[key]
-        return InstallResult(
-            success=False, app_name=app_name, package_id=key, method="none",
-            message=f"⚠️  '{app_name}' cannot be auto-installed. Download from:\n   {url}",
-            download_url=url,
-        )
-
-    if is_installed(app_name):
-        return InstallResult(
-            success=True, app_name=app_name, package_id=key,
-            method="already_installed", already_installed=True,
-            message=f"'{app_name}' is already installed.",
-        )
-
-    # ── apt ───────────────────────────────────────────────────────────────────
-    if _cmd_exists("apt"):
-        package_id = _resolve_apt_pkg(key, app_name)
-        print(f"  [apt] Trying: {package_id}")
-        _run(["sudo", "apt", "update", "-qq"], timeout=60)
-        rc, out, err = _run(["sudo", "apt", "install", "-y", package_id], timeout=300)
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=package_id,
-                method="apt", message=f"✅ Installed '{app_name}' via apt.", output=out,
-            )
-
-    # ── snap fallback ─────────────────────────────────────────────────────────
-    if _cmd_exists("snap"):
-        print(f"  [snap] Trying: {key}")
-        rc, out, err = _run(["sudo", "snap", "install", key], timeout=300)
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=key,
-                method="snap", message=f"✅ Installed '{app_name}' via snap.", output=out,
-            )
-        # Try classic snap
-        rc, out, err = _run(["sudo", "snap", "install", key, "--classic"], timeout=300)
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=key,
-                method="snap",
-                message=f"✅ Installed '{app_name}' via snap (classic).",
-                output=out,
-            )
-
-    # ── flatpak fallback ──────────────────────────────────────────────────────
-    if _cmd_exists("flatpak"):
-        print(f"  [flatpak] Trying: {key}")
-        rc, out, err = _run(
-            ["flatpak", "install", "-y", "flathub", key], timeout=300
-        )
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=key,
-                method="flatpak",
-                message=f"✅ Installed '{app_name}' via flatpak.",
-                output=out,
-            )
-
-    # ── pip fallback ──────────────────────────────────────────────────────────
-    rc, out, err = _run([sys.executable, "-m", "pip", "install", key])
-    if rc == 0:
-        return InstallResult(
-            success=True, app_name=app_name, package_id=key,
-            method="pip",
-            message=f"✅ Installed '{app_name}' as a Python package via pip.",
-            output=out,
-        )
-
-    suggestions = search_package(app_name)
-    suggestion_text = f"\n   Closest matches: {', '.join(suggestions[:3])}" if suggestions else ""
-
-    return InstallResult(
-        success=False, app_name=app_name, package_id=key, method="none",
-        message=(
-            f"⚠️  Could not install '{app_name}' automatically.{suggestion_text}\n"
-            f"   Try: sudo apt search {key}"
-        ),
-    )
-
-
-def _install_macos(app_name: str) -> InstallResult:
-    key = _normalize(app_name)
-
-    if key in UNINSTALLABLE:
-        url = UNINSTALLABLE[key]
-        return InstallResult(
-            success=False, app_name=app_name, package_id=key, method="none",
-            message=f"⚠️  '{app_name}' cannot be auto-installed. Download from:\n   {url}",
-            download_url=url,
-        )
-
-    if is_installed(app_name):
-        return InstallResult(
-            success=True, app_name=app_name, package_id=key,
-            method="already_installed", already_installed=True,
-            message=f"'{app_name}' is already installed.",
-        )
-
-    if _cmd_exists("brew"):
-        package_id = _resolve_brew_pkg(key, app_name)
-        # Try cask first (GUI apps)
-        print(f"  [brew --cask] Trying: {package_id}")
-        rc, out, err = _run(["brew", "install", "--cask", package_id], timeout=300)
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=package_id,
-                method="brew cask",
-                message=f"✅ Installed '{app_name}' via brew cask.",
-                output=out,
-            )
-        # Formula fallback
-        print(f"  [brew formula] Trying: {package_id}")
-        rc, out, err = _run(["brew", "install", package_id], timeout=300)
-        if rc == 0:
-            return InstallResult(
-                success=True, app_name=app_name, package_id=package_id,
-                method="brew formula",
-                message=f"✅ Installed '{app_name}' via brew.",
-                output=out,
-            )
-
-    rc, out, err = _run([sys.executable, "-m", "pip", "install", key])
-    if rc == 0:
-        return InstallResult(
-            success=True, app_name=app_name, package_id=key,
-            method="pip",
-            message=f"✅ Installed '{app_name}' as a Python package via pip.",
-            output=out,
-        )
-
-    suggestions = search_package(app_name)
-    suggestion_text = f"\n   Closest matches: {', '.join(suggestions[:3])}" if suggestions else ""
-
-    return InstallResult(
-        success=False, app_name=app_name, package_id=key, method="none",
-        message=(
-            f"⚠️  Could not install '{app_name}' automatically.{suggestion_text}\n"
-            f"   Try: brew search {key}"
-        ),
-    )
-
-
-# ── Public API ─────────────────────────────────────────────────────────────────
-
-def install_software(app_name: str) -> dict:
-    """
-    Install software using the appropriate package manager for the current OS.
-
-    Resolution order:
-      1. Known alias map (instant)
-      2. Live package manager search (handles anything)
-      3. pip (Python packages)
-      4. Clear failure message with download link / suggestions
-
-    Returns a dict: success, method, message, already_installed, output, download_url
-    """
-    print(f"\n  📦 Installing: {app_name}  (OS: {OS})")
-
-    if OS == "Windows":
-        result = _install_windows(app_name)
-    elif OS == "Linux":
-        result = _install_linux(app_name)
-    elif OS == "Darwin":
-        result = _install_macos(app_name)
-    else:
-        result = InstallResult(
-            success=False, app_name=app_name, package_id=app_name,
-            method="none",
-            message=f"❌ Unsupported OS: {OS}. Manual installation required.",
-        )
-
-    print(f"  {'✅' if result.success else '⚠️ '} {result.message}")
-    return result.to_dict()
