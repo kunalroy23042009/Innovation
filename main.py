@@ -1,13 +1,12 @@
 """
-main.py — AI Setup Agent (with Real Installer)
-===============================================
+main.py — AI Setup Agent (Groq-primary, Ollama-fallback)
+=========================================================
 Entry point for the Local AI Setup Agent.
 
-NEW in this version:
-  - Integrates installer.py for REAL software installation
-  - Uses winget / apt / brew depending on OS
-  - Falls back to GUI automation (agent_graph) for apps not in package managers
-  - Progress is saved to disk so you can resume after a crash
+LLM hierarchy:
+  - Groq  (llama-3.3-70b-versatile)  → primary text / planning
+  - Ollama (llama3)                   → fallback text / planning
+  - Ollama (llava)                    → vision (always local)
 
 Usage:
   python main.py "install vlc"
@@ -22,18 +21,16 @@ import json
 import argparse
 from datetime import datetime
 
-try:
-    import ollama
-except ImportError:
-    raise ImportError("The 'ollama' package is required: pip install ollama")
+# ── LLM client (Groq → Ollama) ────────────────────────────────────────────────
+from llm_client import llm
 
-# Real installer (new module)
+# Real installer
 try:
-    from installer import install_software, is_installed, search_package
+    from Installer import install_software, is_installed, search_package
     HAS_INSTALLER = True
 except ImportError:
     HAS_INSTALLER = False
-    print("[WARN] installer.py not found in the same directory.")
+    print("[WARN] Installer.py not found. Package-manager installs will be skipped.")
 
 # LangGraph GUI orchestrator (fallback for GUI-only apps)
 try:
@@ -42,16 +39,8 @@ try:
 except ImportError:
     HAS_AGENT_GRAPH = False
 
-# ===========================================================================
-# Configuration
-# ===========================================================================
-
-PROGRESS_FILE = "agent_progress.json"
-PLANNER_MODEL = "llama3"
-
-# ===========================================================================
-# Task Planning via Ollama
-# ===========================================================================
+# ── Configuration ─────────────────────────────────────────────────────────────
+PROGRESS_FILE = os.path.join(os.path.expanduser("~"), ".ai_agent_progress.json")
 
 PLANNER_PROMPT = """You are the master task planner for an AI Setup Agent.
 The user wants to install or set up one or more software applications.
@@ -75,18 +64,17 @@ Example:
 Respond with ONLY valid JSON. No markdown. No explanation."""
 
 
+# ── Task planning ─────────────────────────────────────────────────────────────
+
 def generate_task_plan(user_request: str) -> list[dict]:
-    """Use Ollama to parse the user's request into a list of install tasks."""
-    print("🧠 Planning tasks...")
+    """Use Groq (→ Ollama fallback) to parse the user's request into install tasks."""
+    provider = "Groq" if llm.is_groq_available() else "Ollama"
+    print(f"🧠 Planning tasks via {provider}…")
     prompt = PLANNER_PROMPT.format(user_request=user_request)
 
-    try:
-        response = ollama.chat(
-            model=PLANNER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = response.message.content.strip()
+    raw = llm.chat(prompt)
 
+    try:
         # Strip markdown fences if present
         if "```json" in raw:
             raw = raw.split("```json")[1].split("```")[0].strip()
@@ -100,7 +88,6 @@ def generate_task_plan(user_request: str) -> list[dict]:
 
     except Exception as e:
         print(f"⚠️  Planner failed ({e}), falling back to single task.")
-        # Best-effort: treat the whole request as one app name
         return [{
             "app_name": user_request.replace("install", "").strip(),
             "intent": "install",
@@ -108,9 +95,7 @@ def generate_task_plan(user_request: str) -> list[dict]:
         }]
 
 
-# ===========================================================================
-# Progress Tracking
-# ===========================================================================
+# ── Progress tracking ─────────────────────────────────────────────────────────
 
 def load_progress() -> dict:
     if os.path.exists(PROGRESS_FILE):
@@ -132,21 +117,18 @@ def clear_progress():
         os.remove(PROGRESS_FILE)
 
 
-# ===========================================================================
-# Per-app installation logic
-# ===========================================================================
+# ── Per-app install logic ─────────────────────────────────────────────────────
 
 def run_install_task(task: dict, global_context: dict) -> dict:
     """
     Install a single app.
-    1. Try package manager (winget / apt / brew) via installer.py
-    2. If that fails or app needs GUI setup, fall back to agent_graph
-    Returns {"success": bool, "method": str, "message": str}
+    1. Try package manager (winget / apt / brew) via Installer.py
+    2. Fall back to LangGraph GUI agent if package manager fails
     """
     app_name = task.get("app_name", "unknown")
     use_pkg_mgr = task.get("use_package_manager", True)
 
-    # ── Real package manager install ──────────────────────────────
+    # ── Package-manager path ──────────────────────────────────────────────────
     if use_pkg_mgr and HAS_INSTALLER:
         print(f"\n  🔧 Attempting package-manager install for: {app_name}")
         result = install_software(app_name)
@@ -160,22 +142,16 @@ def run_install_task(task: dict, global_context: dict) -> dict:
             }
 
         print(f"\n  ⚠️  Package manager couldn't install '{app_name}'.")
-        # Check if there are search results to suggest
         suggestions = search_package(app_name)
         if suggestions:
-            print(f"  💡 Did you mean one of these?")
+            print("  💡 Did you mean one of these?")
             for s in suggestions[:5]:
                 print(f"     • {s}")
 
-        # Fall through to GUI agent if available
         if not HAS_AGENT_GRAPH:
-            return {
-                "success": False,
-                "method": result["method"],
-                "message": result["message"],
-            }
+            return {"success": False, "method": result["method"], "message": result["message"]}
 
-    # ── GUI agent fallback ────────────────────────────────────────
+    # ── GUI agent fallback ────────────────────────────────────────────────────
     if HAS_AGENT_GRAPH:
         print(f"\n  🖥️  Falling back to GUI automation for: {app_name}")
         try:
@@ -199,24 +175,24 @@ def run_install_task(task: dict, global_context: dict) -> dict:
     }
 
 
-# ===========================================================================
-# Main Orchestrator
-# ===========================================================================
+# ── Main orchestrator ─────────────────────────────────────────────────────────
 
 def run_multi_app_agent(user_request: str, force_restart: bool = False):
     print("=" * 60)
     print("  🌐 AI Setup Agent — Software Installer")
-    print(f"  Request: '{user_request}'")
+    backend = "Groq + Ollama fallback" if llm.is_groq_available() else "Ollama (local)"
+    print(f"  LLM backend : {backend}")
+    print(f"  Request     : '{user_request}'")
     print("=" * 60)
 
-    # ── Load or init state ────────────────────────────────────────
+    # ── Load or init state ────────────────────────────────────────────────────
     state = load_progress()
     if state and not force_restart:
         print(f"\n📥 Found existing progress from {state.get('last_updated', 'unknown')}.")
         resume = input("Resume from where you left off? (y/n): ").strip().lower()
         if resume != "y":
             state = {}
-            print("🔄 Starting fresh...")
+            print("🔄 Starting fresh…")
     else:
         state = {}
 
@@ -235,18 +211,17 @@ def run_multi_app_agent(user_request: str, force_restart: bool = False):
     tasks = state["tasks"]
     current_index = state["current_index"]
 
-    # ── Print plan ────────────────────────────────────────────────
+    # ── Print plan ────────────────────────────────────────────────────────────
     print("\n📋 Install Plan:")
     for i, t in enumerate(tasks):
         status = "✅ DONE" if i < current_index else "⏳ NEXT" if i == current_index else "⏸  QUEUED"
         print(f"  {i+1}. [{status}] {t['app_name']}  ({t.get('intent', 'install')})")
     print("-" * 60)
 
-    # ── Execute tasks ─────────────────────────────────────────────
+    # ── Execute tasks ─────────────────────────────────────────────────────────
     while current_index < len(tasks):
         task = tasks[current_index]
         app_name = task["app_name"]
-
         print(f"\n🚀 Task {current_index + 1}/{len(tasks)}: Installing '{app_name}'")
 
         result = run_install_task(task, state["global_context"])
@@ -271,7 +246,7 @@ def run_multi_app_agent(user_request: str, force_restart: bool = False):
             print("   Run this script again to retry from this point.")
             sys.exit(1)
 
-    # ── Summary ───────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("  🎉 ALL TASKS COMPLETED")
     print("=" * 60)
@@ -284,28 +259,17 @@ def run_multi_app_agent(user_request: str, force_restart: bool = False):
     print("\nDone! ✨")
 
 
-# ===========================================================================
-# Entry point
-# ===========================================================================
+# ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(
-        description="AI Software Installer Agent",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py "install vlc"
-  python main.py "install discord and spotify"
-  python main.py "Set up PostgreSQL and pgAdmin"
-  python main.py --force "install nodejs"
-        """,
+        description="AI Setup Agent — installs software via natural language"
     )
     parser.add_argument(
         "request",
-        type=str,
         nargs="?",
-        default="install vlc",
-        help="What software to install (natural language)",
+        default="",
+        help='What to install, e.g. "install vlc and discord"',
     )
     parser.add_argument(
         "--force",
@@ -314,4 +278,13 @@ Examples:
     )
     args = parser.parse_args()
 
+    if not args.request:
+        print("Usage: python main.py \"install vlc\"")
+        print("       python main.py --force \"install nodejs\"")
+        sys.exit(0)
+
     run_multi_app_agent(args.request, force_restart=args.force)
+
+
+if __name__ == "__main__":
+    main()
