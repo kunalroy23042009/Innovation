@@ -1,247 +1,122 @@
 """
-app_identifier.py — Phase 1: Identify On-Screen Application via Ollama
-======================================================================
+app_identifier.py — Identify On-Screen Application
+=====================================================
+Uses Ollama llava (vision) to identify what app is currently on screen.
+Falls back to text-only Ollama llama3 if no vision model is available.
 
-Refactored to an object-oriented AppIdentifier class utilizing centralized config and logging.
+Vision always goes through Ollama (llava) — consistent with llm_client.py design.
 """
 
 import json
 import re
-import base64
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 from config import config
 from logger import logger, log_step
-
-try:
-    import ollama
-except ImportError:
-    raise ImportError("Please install ollama: pip install ollama")
+from llm_client import llm  # vision → Ollama llava; text → Groq/Ollama
 
 
 class AppIdentifier:
-    """Identifies the application visible in a screenshot using local LLMs."""
+    """Identifies the application visible on screen using vision LLM."""
 
     VISION_PROMPT = """You are an expert at identifying software applications from screenshots.
 
-Analyze the provided screenshot image carefully. Also consider the following OCR-extracted text from the same screen as supplementary context:
+Analyze the provided screenshot. Also consider this OCR text as supplementary context:
 
---- OCR TEXT START ---
+--- OCR TEXT ---
 {ocr_text}
---- OCR TEXT END ---
+--- END OCR TEXT ---
 
-Based on the screenshot and OCR text, identify:
-1. The primary application/software visible on screen
-2. The current state or screen of that application (e.g., "welcome screen", "settings dialog", "file browser", "login page")
-3. Your confidence level: "high", "medium", or "low"
+Identify:
+1. The primary application visible on screen
+2. Its current state (e.g. "welcome screen", "settings dialog", "installer wizard")
+3. Your confidence: "high", "medium", or "low"
 
-IMPORTANT: Respond with ONLY a valid JSON object. No markdown, no code fences, no explanation. Just raw JSON in this exact format:
-{{"app_name": "Name of the application", "app_state": "Current state/screen description", "confidence": "high|medium|low"}}
-"""
+Respond with ONLY raw JSON — no markdown, no explanation:
+{{"app_name": "...", "app_state": "...", "confidence": "high|medium|low"}}"""
 
-    TEXT_ONLY_PROMPT = """You are an expert at identifying software applications from on-screen text.
+    TEXT_ONLY_PROMPT = """You are an expert at identifying software from on-screen text.
 
-I captured a screenshot of my computer screen and extracted the following text using OCR. Based on this text alone, identify what application is currently open.
-
---- OCR TEXT START ---
+OCR text extracted from a screenshot:
+--- OCR TEXT ---
 {ocr_text}
---- OCR TEXT END ---
+--- END OCR TEXT ---
 
-Based on the text above, identify:
-1. The primary application/software visible on screen
-2. The current state or screen of that application (e.g., "welcome screen", "settings dialog", "file browser", "login page")
-3. Your confidence level: "high", "medium", or "low"
+Based on this text, identify:
+1. The primary application visible on screen
+2. Its current state (e.g. "welcome screen", "installer")
+3. Confidence: "high", "medium", or "low"
 
-IMPORTANT: Respond with ONLY a valid JSON object. No markdown, no code fences, no explanation. Just raw JSON in this exact format:
-{{"app_name": "Name of the application", "app_state": "Current state/screen description", "confidence": "high|medium|low"}}
-"""
+Respond with ONLY raw JSON — no markdown, no explanation:
+{{"app_name": "...", "app_state": "...", "confidence": "high|medium|low"}}"""
 
-    def _check_ollama_running(self) -> bool:
-        try:
-            ollama.list()
-            return True
-        except Exception:
-            return False
+    MAX_OCR_CHARS = 3000
 
-    def _get_available_model(self) -> Tuple[str, bool]:
-        try:
-            response = ollama.list()
-            local_models = set()
-            for model_info in response.models:
-                full_name = model_info.model
-                base_name = full_name.split(":")[0]
-                local_models.add(base_name)
-                local_models.add(full_name)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to list Ollama models: {exc}\nIs Ollama running?") from exc
+    def identify_from_screen_result(self, screen_data: dict) -> dict:
+        """
+        Given the dict from read_current_screen(), identify the visible app.
+        Uses vision if a screenshot path is available, otherwise text-only.
+        """
+        image_path = screen_data.get("image_path")
+        ocr_text   = screen_data.get("text", "")
+        timestamp  = screen_data.get("timestamp", datetime.now(timezone.utc).isoformat())
 
-        for model_name in config.preferred_models:
-            if model_name in local_models:
-                is_multimodal = model_name.startswith("llava")
-                return model_name, is_multimodal
+        truncated_ocr = ocr_text[:self.MAX_OCR_CHARS]
+        if len(ocr_text) > self.MAX_OCR_CHARS:
+            truncated_ocr += f"\n... (truncated, {len(ocr_text) - self.MAX_OCR_CHARS} more chars)"
 
-        available = ", ".join(sorted(local_models)) if local_models else "(none)"
-        raise RuntimeError(
-            f"None of the preferred models {config.preferred_models} are available.\n"
-            f"Locally available: {available}"
-        )
+        if image_path and os.path.isfile(image_path):
+            log_step("👁️", "Identifying app via vision (Ollama llava)…")
+            from PIL import Image as PILImage
+            image = PILImage.open(image_path)
+            prompt = self.VISION_PROMPT.format(ocr_text=truncated_ocr or "(none)")
+            raw = llm.vision(image, prompt)
+        else:
+            log_step("📝", "No screenshot — identifying app via OCR text (Ollama llama3)…")
+            prompt = self.TEXT_ONLY_PROMPT.format(ocr_text=truncated_ocr or "(none)")
+            raw = llm.chat(prompt)
 
-    def _encode_image_to_base64(self, image_path: str) -> str:
-        if not os.path.isfile(image_path):
-            raise FileNotFoundError(f"Screenshot not found: {image_path}")
-        with open(image_path, "rb") as img_file:
-            return base64.b64encode(img_file.read()).decode("utf-8")
-
-    def _parse_json_response(self, raw_text: str) -> dict:
-        text = raw_text.strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1).strip())
-            except json.JSONDecodeError:
-                pass
-
-        match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        match = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-
-        raise ValueError(f"Could not extract valid JSON from model response.\nRaw response:\n{text[:500]}")
-
-    def _validate_result(self, parsed: dict) -> dict:
-        return {
-            "app_name": parsed.get("app_name", "Unknown"),
-            "app_state": parsed.get("app_state", "Unknown state"),
+        parsed = self._parse_json(raw)
+        result = {
+            "app_name":   parsed.get("app_name", "Unknown"),
+            "app_state":  parsed.get("app_state", "Unknown state"),
             "confidence": parsed.get("confidence", "low").lower(),
+            "timestamp":  timestamp,
         }
-
-    def identify_app(self, image_path: Optional[str] = None, ocr_text: str = "", force_model: Optional[str] = None) -> dict:
-        if not self._check_ollama_running():
-            raise RuntimeError(f"Ollama is not running or reachable at {config.ollama_host}")
-
-        if force_model:
-            model_name = force_model
-            is_multimodal = "llava" in model_name.lower()
-        else:
-            model_name, is_multimodal = self._get_available_model()
-
-        use_vision = is_multimodal and image_path and os.path.isfile(image_path)
-
-        MAX_OCR_CHARS = 3000
-        truncated_ocr = ocr_text[:MAX_OCR_CHARS] if ocr_text else "(no text detected)"
-        if len(ocr_text) > MAX_OCR_CHARS:
-            truncated_ocr += f"\n... (truncated, {len(ocr_text) - MAX_OCR_CHARS} more chars)"
-
-        timestamp = datetime.now(timezone.utc).isoformat()
-
-        if use_vision:
-            prompt = self.VISION_PROMPT.format(ocr_text=truncated_ocr)
-            image_b64 = self._encode_image_to_base64(image_path)
-            try:
-                response = ollama.chat(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt, "images": [image_b64]}],
-                )
-            except Exception as exc:
-                raise RuntimeError(f"Ollama vision request failed: {exc}") from exc
-            mode = "vision"
-        else:
-            prompt = self.TEXT_ONLY_PROMPT.format(ocr_text=truncated_ocr)
-            if not ocr_text.strip():
-                return {
-                    "app_name": "Unknown", "app_state": "No visual data available",
-                    "confidence": "low", "raw_response": "", "model_used": model_name,
-                    "mode": "text-only", "timestamp": timestamp,
-                }
-            try:
-                response = ollama.chat(
-                    model=model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-            except Exception as exc:
-                raise RuntimeError(f"Ollama text request failed: {exc}") from exc
-            mode = "text-only"
-
-        raw_response = response.message.content
-
-        try:
-            parsed = self._parse_json_response(raw_response)
-            result = self._validate_result(parsed)
-        except ValueError:
-            result = {
-                "app_name": "Unknown (parse error)", "app_state": "Could not parse model response", "confidence": "low",
-            }
-
-        result["raw_response"] = raw_response
-        result["model_used"] = model_name
-        result["mode"] = mode
-        result["timestamp"] = timestamp
-
+        log_step("🎯", f"Identified: {result['app_name']} ({result['confidence']} confidence)")
         return result
 
-
-_global_identifier = AppIdentifier()
-
-def identify_app(image_path: Optional[str] = None, ocr_text: str = "", force_model: Optional[str] = None) -> dict:
-    return _global_identifier.identify_app(image_path, ocr_text, force_model)
-
-def identify_from_screen_result(screen_result: dict, **kwargs) -> dict:
-    return identify_app(
-        image_path=screen_result.get("image_path"),
-        ocr_text=screen_result.get("text", ""),
-        **kwargs,
-    )
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Phase 1 — Identify on-screen application via Ollama.")
-    parser.add_argument("--image", type=str, default=None, help="Path to an existing screenshot image.")
-    parser.add_argument("--text", type=str, default=None, help="OCR text to use.")
-    parser.add_argument("--model", type=str, default=None, help="Force a specific Ollama model.")
-    args = parser.parse_args()
-
-    image_path = args.image
-    ocr_text = args.text
-
-    if image_path is None or ocr_text is None:
+    def _parse_json(self, raw: str) -> dict:
+        text = raw.strip()
+        # Direct
         try:
-            from screen_reader import read_current_screen, extract_text
-            from PIL import Image
-        except ImportError:
-            logger.error("screen_reader.py not found.")
-            sys.exit(1)
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Fenced
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1).strip())
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Inline object
+        m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        logger.warning(f"Could not parse app identifier JSON. Raw: {text[:300]}")
+        return {"app_name": "Unknown", "app_state": "parse error", "confidence": "low"}
 
-        if image_path is None and ocr_text is None:
-            screen = read_current_screen()
-            image_path = screen["image_path"]
-            ocr_text = screen["text"]
-        elif image_path is None:
-            screen = read_current_screen(save_screenshot=True)
-            image_path = screen["image_path"]
-        elif ocr_text is None:
-            img = Image.open(image_path)
-            ocr_text = extract_text(img)
 
-    try:
-        result = identify_app(image_path=image_path, ocr_text=ocr_text, force_model=args.model)
-        logger.info(f"Identified App: {result['app_name']} - {result['app_state']} (Confidence: {result['confidence']})")
-    except RuntimeError as err:
-        logger.error(err)
-        sys.exit(1)
+# ── Module-level singleton + helper ───────────────────────────────────────────
+
+_identifier = AppIdentifier()
+
+def identify_from_screen_result(screen_data: dict) -> dict:
+    return _identifier.identify_from_screen_result(screen_data)
