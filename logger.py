@@ -1,51 +1,50 @@
 """
 logger.py — Standardized Logging
-================================
-Provides a centralized logger for the AI Setup Agent.
+==================================
+Centralized logger for the AI Setup Agent.
+Logs to both console (clean) and file (detailed).
 """
 
 import logging
 import sys
 from config import config
 
-# Create logger
+
 logger = logging.getLogger("ai_agent")
 
+
 def setup_logger() -> logging.Logger:
-    """Configures the root logger with file and console handlers."""
+    """Configure the root logger with console + file handlers."""
     if logger.hasHandlers():
         return logger
 
     logger.setLevel(logging.DEBUG if config.debug_mode else logging.INFO)
 
-    # Formatter for console (cleaner, no debug info unless necessary)
-    console_formatter = logging.Formatter("[%(asctime)s] %(message)s", "%H:%M:%S")
-    
-    # Formatter for file (detailed)
-    file_formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    console_fmt = logging.Formatter("[%(asctime)s] %(message)s", "%H:%M:%S")
+    file_fmt    = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
 
-    # Console Handler
+    # Console handler
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(logging.DEBUG if config.debug_mode else logging.INFO)
-    ch.setFormatter(console_formatter)
+    ch.setFormatter(console_fmt)
     logger.addHandler(ch)
 
-    # File Handler
+    # File handler
     try:
         fh = logging.FileHandler(config.log_file, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
-        fh.setFormatter(file_formatter)
+        fh.setFormatter(file_fmt)
         logger.addHandler(fh)
-    except Exception as e:
-        print(f"Failed to setup file logging: {e}")
+    except Exception as exc:
+        print(f"[WARN] File logging unavailable: {exc}")
 
     return logger
 
-# Initialize logger upon import
+
+# Auto-init on import
 setup_logger()
 
+
 def log_step(icon: str, message: str) -> None:
-    """Helper to log with a nice icon."""
+    """Log a step with an icon prefix — keeps output scannable."""
     logger.info(f"{icon} {message}")
