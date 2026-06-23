@@ -1,14 +1,23 @@
-mss==10.2.0
-Pillow==12.2.0
-pytesseract==0.3.13
-ollama==0.6.2
-requests==2.33.1
-beautifulsoup4==4.13.5
-pypdf==6.11.0
-pyautogui==0.9.54
-pygetwindow==0.0.9
-langgraph==1.2.4
-langchain-core==1.4.6
-langchain-groq==1.1.3
-groq==0.37.1
-keyboard==0.13.5
+# AI Setup Agent — Python dependencies
+# Install with: pip install -r requirements.txt
+
+# ── LLM providers ─────────────────────────────────────────────────────────────
+groq>=0.9.0          # Primary text/planning LLM (Groq cloud)
+ollama>=0.2.0        # Fallback text LLM + vision LLM (local)
+
+# ── Orchestration ──────────────────────────────────────────────────────────────
+langgraph>=0.1.0     # Agent state machine
+
+# ── GUI automation ─────────────────────────────────────────────────────────────
+pyautogui>=0.9.54
+pygetwindow>=0.0.9   # Window focus (Windows only)
+mss>=9.0.1           # Fast screen capture (fallback)
+Pillow>=10.0.0       # Image handling
+
+# ── Web / docs ─────────────────────────────────────────────────────────────────
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+pypdf>=4.0.0         # PDF doc parsing (optional)
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0 # Load GROQ_API_KEY from .env
