@@ -1,91 +1,136 @@
-# AI Setup Agent
+# 🤖 Innovation — AI Setup Agent
 
-A fully autonomous AI Setup Agent that can identify on-screen applications, fetch official installation documentation, and use computer vision and keyboard/mouse automation to install and configure software for you.
+An AI-powered software installation agent that understands natural language and installs software automatically on your machine — using package managers where possible, and GUI automation as a fallback.
+
+```bash
+python main.py "install vlc and discord"
+python main.py "Set up PostgreSQL and pgAdmin"
+python main.py --force "install nodejs"
+```
+
+---
+
+## How It Works
+
+```
+User Request
+    ↓
+main.py  →  LLM plans tasks  →  [ "install VLC", "install Discord" ]
+    ↓
+For each app:
+  1. Installer.py  →  winget / apt / brew  (fast path)
+  2. agent_graph.py  →  LangGraph state machine  (GUI fallback)
+       ├── screen_reader.py   →  screenshot + OCR
+       ├── app_identifier.py  →  identify what's on screen
+       ├── doc_fetcher.py     →  fetch official install docs
+       └── action_executor.py →  mouse/keyboard automation
+```
+
+---
+
+## LLM Architecture
+
+| Task | Provider |
+|------|----------|
+| Task planning | **Groq** (llama-3.3-70b) → Ollama fallback |
+| Doc step extraction | **Groq** (llama-3.3-70b) → Ollama fallback |
+| Failure advice | **Groq** (llama-3.1-8b-instant) → Ollama fallback |
+| Screen reading (vision) | **Ollama llava** (always local) |
+
+If `GROQ_API_KEY` is not set, everything runs on local Ollama automatically.
+
+---
+
+## Setup
+
+### 1. Prerequisites
+
+- Python 3.11+
+- [Ollama](https://ollama.com/download) running locally (for vision)
+- [Groq API key](https://console.groq.com/keys) (free, for fast text inference)
+- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) (for screen reading)
+
+### 2. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 3. Pull Ollama models
+
+```bash
+ollama pull llava     # vision model (required)
+ollama pull llama3    # text fallback (used if Groq is unavailable)
+```
+
+### 4. Configure environment
+
+```bash
+cp .env.example .env
+# Edit .env and add your GROQ_API_KEY
+```
+
+Or just set it inline:
+```bash
+export GROQ_API_KEY=gsk_...
+```
+
+### 5. Run
+
+```bash
+# Single app
+python main.py "install vlc"
+
+# Multiple apps (planned and executed sequentially)
+python main.py "install discord and spotify"
+
+# Force fresh start (ignore resume prompt)
+python main.py --force "install postgresql and pgadmin"
+```
+
+---
 
 ## Features
 
-* **Multi-App Orchestration**: Parses natural language requests (e.g., "Install Docker and PostgreSQL") and creates sequential execution plans using LangGraph.
-* **On-Screen Identification**: Uses OCR (Tesseract) and local Vision LLMs (Ollama + LLaVA) to identify what application is currently on screen.
-* **Intelligent Doc Fetching**: Scrapes official documentation pages, recursively follows links, and extracts specific, actionable setup steps using local LLMs.
-* **Robust Execution**: Plans UI interactions (clicks, typing, shortcuts), attempts keyboard fallbacks, and verifies success using computer vision screenshots.
-* **Floating Overlay UI**: A Catppuccin-styled Tkinter overlay that provides real-time logs, status indicators, and an easy input bar for triggering the agent.
-* **Privacy-First**: Designed to run entirely on local, open-weights models (via Ollama) keeping your screen captures completely private.
+- **Natural language input** — just describe what you want installed
+- **Cross-platform** — Windows (winget), Linux (apt), macOS (brew)
+- **Resume on crash** — progress is saved to disk, resume where you left off
+- **GUI automation fallback** — handles apps not available in package managers
+- **LLM-powered advice** — when a step fails, AI suggests a fix
+- **Groq + Ollama** — fast cloud inference with local fallback, zero vendor lock-in
 
-## Architecture
+---
 
-The project is built around a modular, object-oriented architecture:
+## Project Structure
 
-* **`main.py`**: The `SetupOrchestrator` that parses user requests and coordinates the setup of multiple applications.
-* **`agent_graph.py`**: The `SetupAgentGraph` which uses `langgraph` to build a reliable state machine with retries, failure handling, and user-in-the-loop interventions.
-* **`action_executor.py`**: The `ActionExecutor` that converts setup steps into precise UI interactions (clicks, typing) via `pyautogui` and validates them using screenshots.
-* **`app_identifier.py`**: Identifies applications from screenshots using Multimodal LLMs.
-* **`doc_fetcher.py`**: Scrapes and parses setup instructions into actionable JSON steps.
-* **`screen_reader.py`**: Handles screenshot capturing (`mss`) and text extraction (`pytesseract`).
-* **`overlay.py`**: The floating Tkinter UI.
-* **`config.py` & `logger.py`**: Centralized configuration and logging.
-
-## Prerequisites
-
-1. **Python 3.10+**
-2. **Ollama**: Must be installed and running locally. [Download Ollama](https://ollama.com/download)
-   * Pull the required models:
-     ```bash
-     ollama pull llava
-     ollama pull llama3
-     ```
-3. **Tesseract OCR**: 
-   * Windows: [Download Installer](https://github.com/UB-Mannheim/tesseract/wiki) (Install to default `C:\Program Files\Tesseract-OCR\tesseract.exe` or update `config.py`)
-
-## Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/kunalroy23042009/Innovation.git
-   cd Innovation
-   ```
-2. Install the required Python packages:
-   ```bash
-   pip install requests beautifulsoup4 ollama pypdf mss Pillow pytesseract pyautogui pygetwindow langgraph keyboard
-   ```
-
-## Usage
-
-### Run via Command Line
-
-You can run the orchestrator directly from the terminal by providing a natural language request:
-
-```bash
-python main.py "Install Docker Desktop and then install PostgreSQL"
+```
+Innovation/
+├── main.py            # Entry point & orchestrator
+├── llm_client.py      # Unified LLM client (Groq → Ollama fallback)
+├── agent_graph.py     # LangGraph state machine for GUI installs
+├── action_executor.py # Mouse/keyboard automation
+├── screen_reader.py   # Screenshot + OCR
+├── app_identifier.py  # Vision-based app identification
+├── doc_fetcher.py     # Fetch & parse install documentation
+├── Installer.py       # Package manager wrapper (winget/apt/brew)
+├── config.py          # Centralized configuration
+├── logger.py          # Logging setup
+├── requirements.txt   # Python dependencies
+└── .env.example       # Environment variable template
 ```
 
-To run a single app setup pipeline without the orchestrator:
+---
 
-```bash
-python agent_graph.py --app "PostgreSQL"
-```
+## Environment Variables
 
-### Run via the Floating Overlay
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GROQ_API_KEY` | Recommended | Groq API key for fast cloud LLM inference |
+| `OLLAMA_HOST` | No | Ollama server URL (default: `http://localhost:11434`) |
+| `AI_AGENT_DEBUG` | No | Set to `true` for verbose logging |
 
-To use the interactive floating UI:
-
-```bash
-python overlay.py
-```
-* **Toggle UI**: Press `Ctrl+Space`
-* Enter your setup command directly into the input bar and click **Run**.
-
-## Configuration
-
-All global settings (model selection, API keys, timeouts, color themes) are managed in `config.py`.
-
-* Change `vision_model` (default: `llava`) and `text_model` (default: `llama3`).
-* To use Groq for ultra-fast failure analysis, set the `GROQ_API_KEY` environment variable.
-
-## Safety & Fail-Safes
-
-* **PyAutoGUI Failsafe**: Move your mouse to any of the four corners of your screen (e.g., Top-Left `(0,0)`) to immediately abort all automation.
-* **Dry Run Mode**: You can test the planning and documentation scraping without executing any actions using the `--dry-run` flag.
+---
 
 ## License
 
-MIT License
+MIT
