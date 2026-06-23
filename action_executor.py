@@ -1,8 +1,12 @@
 """
-action_executor.py — Phase 3: AI-Driven Mouse/Keyboard Automation
-=================================================================
+action_executor.py — AI-Driven Mouse/Keyboard Automation
+==========================================================
+Translates high-level setup steps into real GUI actions.
 
-Refactored to an object-oriented ActionExecutor class utilizing centralized config and logging.
+LLM usage:
+  - Action planning  → llm.chat()   (Groq → Ollama text fallback)
+  - Element location → llm.vision() (Ollama llava, always local)
+  - Step verification→ llm.vision() (Ollama llava, always local)
 """
 
 import json
@@ -20,17 +24,13 @@ from PIL import Image
 
 from config import config
 from logger import logger, log_step
+from llm_client import llm  # unified Groq → Ollama client
 
 try:
     import pygetwindow as gw
     HAS_PYGETWINDOW = True
 except ImportError:
     HAS_PYGETWINDOW = False
-
-try:
-    import ollama
-except ImportError:
-    raise ImportError("Please install ollama: pip install ollama")
 
 try:
     from screen_reader import capture_screen
@@ -41,15 +41,11 @@ except ImportError:
             raw = sct.grab(sct.monitors[monitor_index])
             return Image.frombytes("RGB", raw.size, raw.rgb)
 
-# FAILSAFE: move mouse to top-left (0,0) at any time to abort everything
 pyautogui.FAILSAFE = True
-# Built-in pause between every single pyautogui call — DO NOT set to 0
 pyautogui.PAUSE = 0.4
 
 
 class PromptTemplates:
-    """Stores all prompt templates for the LLMs."""
-
     PLAN_ACTION = """You are an automation agent controlling a Windows 11 PC.
 Convert this installation/setup step into a single concrete computer action.
 
@@ -110,20 +106,18 @@ LENIENCY RULES — mark success=true if ANY of these apply:
   - The UI changed in the expected direction
 
 Mark success=false ONLY if there is CLEAR evidence the action had NO effect at all.
-Do NOT fail because:
-  - A terminal or PowerShell window is visible in the background
-  - The exact wording of expected_result doesn't match perfectly
-  - There are extra windows open
 
 Respond with ONLY this JSON, no markdown:
 {{"success": true|false, "confidence": "high|medium|low", "observation": "what you see (max 150 chars)", "suggestion": "if failed: one specific next thing to try"}}"""
 
 
 class ActionExecutor:
-    """Executes planned actions securely with retries and fallbacks."""
+    """Executes planned actions with retries and fallbacks."""
 
     def __init__(self):
         os.makedirs(config.screenshot_dir, exist_ok=True)
+
+    # ── Screenshot helpers ────────────────────────────────────────────────────
 
     def _take_screenshot(self, label: str = "action") -> Tuple[Image.Image, str]:
         image = capture_screen(monitor_index=0)
@@ -133,11 +127,6 @@ class ActionExecutor:
         image.save(path, format="PNG")
         return image, path
 
-    def _image_to_base64(self, image: Image.Image) -> str:
-        buf = io.BytesIO()
-        image.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-
     def _is_center_coord(self, x: int, y: int, image: Image.Image) -> bool:
         w, h = image.size
         cx, cy = w // 2, h // 2
@@ -145,82 +134,20 @@ class ActionExecutor:
         radius_y = h * config.center_rejection_radius_pct
         return abs(x - cx) < radius_x and abs(y - cy) < radius_y
 
-    def _ask_ollama_vision(self, image: Image.Image, prompt: str) -> str:
-        try:
-            response = ollama.chat(
-                model=config.vision_model,
-                messages=[{
-                    "role": "user",
-                    "content": prompt,
-                    "images": [self._image_to_base64(image)],
-                }],
-            )
-            return response.message.content.strip()
-        except Exception as exc:
-            return f"[OLLAMA ERROR] {exc}"
-
-    def _ask_ollama_text(self, prompt: str) -> str:
-        try:
-            response = ollama.chat(
-                model=config.text_model,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.message.content.strip()
-        except Exception as exc:
-            return f"[OLLAMA ERROR] {exc}"
-
-    def _parse_json_safe(self, raw: str, default: dict) -> dict:
-        text = raw.strip()
-        try:
-            p = json.loads(text)
-            if isinstance(p, dict):
-                return p
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
-        if m:
-            try:
-                p = json.loads(m.group(1).strip())
-                if isinstance(p, dict):
-                    return p
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.DOTALL)
-        if m:
-            try:
-                p = json.loads(m.group(0))
-                if isinstance(p, dict):
-                    return p
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        fixed = re.sub(r",\s*([}\]])", r"\1", text)
-        fixed = re.sub(r"(?<![\\])'", '"', fixed)
-        m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", fixed, re.DOTALL)
-        if m:
-            try:
-                p = json.loads(m.group(0))
-                if isinstance(p, dict):
-                    return p
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        return default
+    # ── LLM calls (all routing via llm_client) ────────────────────────────────
 
     def _plan_action(self, step: dict) -> dict:
         prompt = PromptTemplates.PLAN_ACTION.format(
             action=step.get("action", ""),
             expected_result=step.get("expected_result", ""),
         )
-        raw = self._ask_ollama_text(prompt)
+        raw = llm.chat(prompt)
         return self._parse_json_safe(raw, default={
             "action_type": "custom",
             "target_description": step.get("action", ""),
             "text_to_type": "",
             "key_to_press": "",
-            "notes": "Could not parse action plan — using raw step as custom action",
+            "notes": "Could not parse action plan.",
         })
 
     def _locate_element(self, image: Image.Image, target_description: str) -> dict:
@@ -232,8 +159,7 @@ class ActionExecutor:
             target_description=target_description,
             width=width, height=height, taskbar_y=taskbar_y, cx=cx, cy=cy,
         )
-
-        raw = self._ask_ollama_vision(image, prompt)
+        raw = llm.vision(image, prompt)
         result = self._parse_json_safe(raw, default={
             "x": 0, "y": 0, "found": False,
             "confidence": "low", "reason": "JSON parse failed",
@@ -242,304 +168,267 @@ class ActionExecutor:
         if result.get("found", False):
             x = max(0, min(int(result.get("x", 0)), width - 1))
             y = max(0, min(int(result.get("y", 0)), height - 1))
-
             if self._is_center_coord(x, y, image):
-                logger.warning(f"Rejected center coords ({x},{y}) — llava hallucination guard")
-                return {
-                    "x": 0, "y": 0, "found": False, "confidence": "low",
-                    "reason": f"Returned center-area coords ({x},{y}) — rejected as probable hallucination",
-                }
-
+                logger.warning(f"Rejected center coords ({x},{y}) — hallucination guard")
+                return {"x": 0, "y": 0, "found": False, "confidence": "low",
+                        "reason": f"Centre-area coords ({x},{y}) rejected as probable hallucination"}
             result["x"] = x
             result["y"] = y
-
         return result
-
-    def _locate_element_keyboard_fallback(self, action_type: str, action_plan: dict) -> Tuple[bool, str]:
-        target = (action_plan.get("target_description") or "").lower()
-        notes = (action_plan.get("notes") or "").lower()
-        combo = target + " " + notes
-
-        if any(k in combo for k in ["start menu", "start button", "windows button", "windows logo"]):
-            pyautogui.hotkey("win")
-            time.sleep(0.9)
-            return True, "Opened Start Menu via Win key (keyboard fallback)"
-
-        if any(k in combo for k in ["search bar", "search box", "search field", "taskbar search"]):
-            pyautogui.hotkey("win", "s")
-            time.sleep(0.6)
-            return True, "Opened search via Win+S (keyboard fallback)"
-
-        if "file menu" in combo or combo.strip() == "file":
-            pyautogui.hotkey("alt", "f")
-            time.sleep(0.3)
-            return True, "Opened File menu via Alt+F (keyboard fallback)"
-
-        if any(k in combo for k in ["ok button", "next button", "install button", "finish button", "yes button", "accept button", "continue button", "agree button"]):
-            pyautogui.press("tab")
-            time.sleep(0.2)
-            pyautogui.press("enter")
-            return True, "Pressed Tab→Enter to activate dialog button (keyboard fallback)"
-
-        if any(k in combo for k in ["close button", "x button", "exit button", "close window"]):
-            pyautogui.hotkey("alt", "f4")
-            return True, "Pressed Alt+F4 to close window (keyboard fallback)"
-
-        if "task manager" in combo:
-            pyautogui.hotkey("ctrl", "shift", "esc")
-            time.sleep(1.0)
-            return True, "Opened Task Manager via Ctrl+Shift+Esc (keyboard fallback)"
-
-        if "run dialog" in combo or "run box" in combo:
-            pyautogui.hotkey("win", "r")
-            time.sleep(0.5)
-            return True, "Opened Run dialog via Win+R (keyboard fallback)"
-
-        if "settings" in combo or "windows settings" in combo:
-            pyautogui.hotkey("win", "i")
-            time.sleep(1.0)
-            return True, "Opened Settings via Win+I (keyboard fallback)"
-
-        return False, "No keyboard fallback available for this element"
 
     def _verify_step(self, image: Image.Image, step: dict) -> dict:
         prompt = PromptTemplates.VERIFY_STEP.format(
             action=step.get("action", ""),
             expected_result=step.get("expected_result", ""),
         )
-        raw = self._ask_ollama_vision(image, prompt)
+        raw = llm.vision(image, prompt)
         return self._parse_json_safe(raw, default={
-            "success": False, "confidence": "low",
-            "observation": "Could not parse verification response",
-            "suggestion": "Verify manually",
+            "success": False,
+            "confidence": "low",
+            "observation": "Could not parse verification response.",
+            "suggestion": "",
         })
 
-    def _execute_action(self, action_type: str, action_plan: dict, element_location: Optional[dict]) -> Tuple[str, bool]:
+    # ── JSON parsing ──────────────────────────────────────────────────────────
+
+    def _parse_json_safe(self, raw: str, default: dict) -> dict:
+        text = raw.strip()
+        # Direct parse
         try:
-            if action_type in ("click", "double_click", "right_click"):
-                if element_location and element_location.get("found"):
-                    x = element_location["x"]
-                    y = element_location["y"]
-                    loc = element_location.get("location_description", "")
+            p = json.loads(text)
+            if isinstance(p, dict):
+                return p
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Markdown fences
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
+        if m:
+            try:
+                p = json.loads(m.group(1).strip())
+                if isinstance(p, dict):
+                    return p
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Inline object
+        m = re.search(r"\{(?:[^{}]|\{[^{}]*\})*\}", text, re.DOTALL)
+        if m:
+            try:
+                p = json.loads(m.group(0))
+                if isinstance(p, dict):
+                    return p
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return default
 
-                    pyautogui.moveTo(x, y, duration=0.4)
-                    time.sleep(0.15)
-                    if action_type == "click":
-                        pyautogui.click(x, y, button="left")
-                        return f"Clicked at ({x}, {y}) — {loc}", False
-                    elif action_type == "double_click":
-                        pyautogui.doubleClick(x, y)
-                        return f"Double-clicked at ({x}, {y})", False
-                    elif action_type == "right_click":
-                        pyautogui.rightClick(x, y)
-                        return f"Right-clicked at ({x}, {y})", False
+    # ── Keyboard shortcut fallbacks ───────────────────────────────────────────
 
-                ok, note = self._locate_element_keyboard_fallback(action_type, action_plan)
-                if ok: return note, True
-                return f"Cannot {action_type}: element not found and no keyboard fallback matched. Target: '{action_plan.get('target_description', '?')}'", False
+    def _locate_element_keyboard_fallback(self, action_type: str, action_plan: dict) -> Tuple[bool, str]:
+        target = (action_plan.get("target_description") or "").lower()
+        notes  = (action_plan.get("notes") or "").lower()
+        combo  = target + " " + notes
 
-            elif action_type == "type_text":
-                text = action_plan.get("text_to_type", "")
-                if text:
-                    try:
-                        pyautogui.write(text, interval=0.04)
-                    except Exception:
-                        import subprocess
-                        safe_text = text.replace("'", "''")
-                        subprocess.run(["powershell", "-Command", f"Set-Clipboard -Value '{safe_text}'"], capture_output=True)
-                        pyautogui.hotkey("ctrl", "v")
-                    return f"Typed: '{text[:50]}...'", False
-                return "type_text: no text_to_type specified", False
+        shortcuts = [
+            (["start menu", "start button", "windows button", "windows logo"],
+             lambda: (pyautogui.hotkey("win"), time.sleep(0.9)),
+             "Opened Start Menu via Win key"),
+            (["task manager"],
+             lambda: (pyautogui.hotkey("ctrl", "shift", "esc"), time.sleep(1.5)),
+             "Opened Task Manager via Ctrl+Shift+Esc"),
+            (["file explorer", "windows explorer"],
+             lambda: (pyautogui.hotkey("win", "e"), time.sleep(1.5)),
+             "Opened File Explorer via Win+E"),
+            (["run dialog", "run box"],
+             lambda: (pyautogui.hotkey("win", "r"), time.sleep(0.8)),
+             "Opened Run dialog via Win+R"),
+            (["desktop"],
+             lambda: (pyautogui.hotkey("win", "d"), time.sleep(0.8)),
+             "Showed Desktop via Win+D"),
+        ]
 
-            elif action_type == "press_key":
-                key_combo = action_plan.get("key_to_press", "").strip().lower()
-                if key_combo:
-                    if "+" in key_combo:
-                        keys = [k.strip() for k in key_combo.split("+")]
-                        pyautogui.hotkey(*keys)
-                    else:
-                        pyautogui.press(key_combo)
-                    return f"Pressed key: {key_combo}", False
-                return "press_key: no key_to_press specified", False
+        for keywords, action_fn, msg in shortcuts:
+            if any(kw in combo for kw in keywords):
+                action_fn()
+                return True, msg
 
-            elif action_type == "scroll":
-                direction = action_plan.get("scroll_direction", "down")
-                amount = int(action_plan.get("scroll_amount", 3))
-                clicks = amount if direction.lower() == "up" else -amount
-                pyautogui.scroll(clicks)
-                return f"Scrolled {direction} {amount} clicks", False
+        return False, ""
 
-            elif action_type == "wait":
-                secs = float(action_plan.get("wait_seconds", 2))
-                time.sleep(secs)
-                return f"Waited {secs}s", False
+    # ── Action dispatch ───────────────────────────────────────────────────────
 
-            elif action_type == "focus_window":
-                title = action_plan.get("window_title", "")
-                if title and HAS_PYGETWINDOW:
-                    matches = gw.getWindowsWithTitle(title) or [w for w in gw.getAllWindows() if title.lower() in (w.title or "").lower()]
-                    if matches:
-                        w = matches[0]
-                        if w.isMinimized: w.restore()
-                        w.activate()
-                        time.sleep(0.4)
-                        return f"Focused window: '{title}'", False
-                return "focus_window: could not focus window", False
+    def _perform_action(
+        self,
+        action_plan: dict,
+        image_before: Image.Image,
+        dry_run: bool = False,
+    ) -> Tuple[bool, str]:
+        action_type = action_plan.get("action_type", "custom").lower()
+        target_desc = action_plan.get("target_description", "")
 
-            elif action_type == "open_app":
-                app = action_plan.get("app_to_open", "")
-                if app:
-                    if os.path.isfile(app):
-                        os.startfile(app)
-                    else:
-                        pyautogui.hotkey("win")
-                        time.sleep(0.9)
-                        pyautogui.write(app, interval=0.05)
-                        time.sleep(0.6)
-                        pyautogui.press("enter")
-                    time.sleep(2.0)
-                    return f"Launched: {app}", False
-                return "open_app: no app_to_open specified", False
+        if dry_run:
+            return True, f"[DRY RUN] Would perform: {action_type} on '{target_desc}'"
 
-            elif action_type == "custom":
-                ok, note = self._locate_element_keyboard_fallback(action_type, action_plan)
-                if ok: return note, True
-                desc = action_plan.get("target_description") or action_plan.get("notes", "")
-                return f"Custom action (needs manual execution): {desc[:200]}", False
+        # Keyboard shortcut fast-path
+        kb_ok, kb_msg = self._locate_element_keyboard_fallback(action_type, action_plan)
+        if kb_ok:
+            return True, kb_msg
 
-            return f"Unknown action_type: '{action_type}'", False
+        # Actions that don't need coords
+        if action_type == "type_text":
+            text = action_plan.get("text_to_type", "")
+            pyautogui.typewrite(text, interval=0.05)
+            return True, f"Typed: '{text[:50]}'"
 
-        except pyautogui.FailSafeException:
-            raise
-        except Exception as exc:
-            return f"Action error: {type(exc).__name__}: {exc}", False
+        if action_type == "press_key":
+            keys = [k.strip() for k in action_plan.get("key_to_press", "enter").split("+")]
+            pyautogui.hotkey(*keys)
+            return True, f"Pressed: {'+'.join(keys)}"
 
-    def execute_step(self, step: dict, dry_run: bool = False, take_screenshots: bool = True, use_vision: bool = True) -> dict:
-        timestamp = datetime.now(timezone.utc).isoformat()
-        step_num = step.get("step_number", 0)
+        if action_type == "scroll":
+            direction = action_plan.get("scroll_direction", "down")
+            amount = int(action_plan.get("scroll_amount", 3))
+            clicks = amount if direction == "down" else -amount
+            pyautogui.scroll(clicks)
+            return True, f"Scrolled {direction} by {amount}"
 
-        logger.info(f"▶ Step {step_num}: {step.get('action', '?')[:80]}")
+        if action_type == "wait":
+            seconds = float(action_plan.get("wait_seconds", 2))
+            time.sleep(seconds)
+            return True, f"Waited {seconds}s"
 
-        action_plan = self._plan_action(step)
-        action_type = action_plan.get("action_type", "custom")
+        if action_type == "focus_window" and HAS_PYGETWINDOW:
+            title = action_plan.get("window_title", "")
+            matches = gw.getWindowsWithTitle(title)
+            if matches:
+                matches[0].activate()
+                time.sleep(0.5)
+                return True, f"Focused window: '{title}'"
+            return False, f"Window '{title}' not found"
 
-        attempts_log = []
-        final_result = None
-        before_image = None
-        screenshot_before = None
+        if action_type == "open_app":
+            app = action_plan.get("app_to_open", "")
+            pyautogui.hotkey("win", "r")
+            time.sleep(0.6)
+            pyautogui.typewrite(app, interval=0.05)
+            pyautogui.press("enter")
+            time.sleep(2.0)
+            return True, f"Launched: '{app}'"
 
-        for attempt in range(1, config.max_retries + 2):
-            is_retry = attempt > 1
-            if is_retry:
-                logger.info(f"↻ Retry {attempt - 1}/{config.max_retries}...")
+        # Click-based actions — need vision to locate the element
+        loc = self._locate_element(image_before, target_desc)
+        if not loc.get("found", False):
+            return False, f"Could not locate element: '{target_desc}' — {loc.get('reason', '')}"
 
+        x, y = loc["x"], loc["y"]
+        conf = loc.get("confidence", "?")
+        log_step("🎯", f"Located '{target_desc[:50]}' at ({x},{y}) [{conf} confidence]")
+
+        click_map = {
+            "click":        lambda: pyautogui.click(x, y),
+            "double_click": lambda: pyautogui.doubleClick(x, y),
+            "right_click":  lambda: pyautogui.rightClick(x, y),
+        }
+        fn = click_map.get(action_type, lambda: pyautogui.click(x, y))
+        fn()
+        return True, f"{action_type} at ({x},{y}) on '{target_desc[:40]}'"
+
+    # ── Public execute method ─────────────────────────────────────────────────
+
+    def execute_step(
+        self,
+        step: dict,
+        dry_run: bool = False,
+        take_screenshots: bool = True,
+        use_vision: bool = True,
+    ) -> dict:
+        """Execute a single setup step with retries and verification."""
+        action_text    = step.get("action", "unknown")
+        expected       = step.get("expected_result", "")
+        max_attempts   = config.max_retries + 1
+        attempts: List[dict] = []
+
+        for attempt_num in range(1, max_attempts + 1):
+            log_step("▶️", f"Attempt {attempt_num}/{max_attempts}: {action_text[:60]}")
+
+            screenshot_before_path = None
+            image_before = None
             if take_screenshots:
-                label = f"step{step_num}_att{attempt}_before"
-                before_image, screenshot_before = self._take_screenshot(label)
+                image_before, screenshot_before_path = self._take_screenshot(
+                    f"before_{action_text[:30]}_attempt{attempt_num}"
+                )
 
-            element_location = None
-            if action_type in ("click", "double_click", "right_click") and use_vision:
-                target_desc = action_plan.get("target_description", "")
-                img_src = before_image if before_image else capture_screen(0)
-                element_location = self._locate_element(img_src, target_desc)
+            # Plan the action
+            action_plan = self._plan_action(step)
+            log_step("📝", f"Plan: {action_plan.get('action_type')} → {action_plan.get('target_description', '')[:50]}")
 
-                if not element_location.get("found"):
-                    logger.warning(f"Not found: {element_location.get('reason', 'unknown')}")
+            time.sleep(config.action_delay)
 
-            if dry_run:
-                note, used_fallback = f"Dry run — {action_type} not executed", False
-            else:
-                note, used_fallback = self._execute_action(action_type, action_plan, element_location)
-                logger.info(f"{'Fallback' if used_fallback else 'Result'}: {note}")
+            # Perform the action
+            ok, msg = self._perform_action(
+                action_plan,
+                image_before or Image.new("RGB", (1920, 1080)),
+                dry_run=dry_run,
+            )
+            log_step("✅" if ok else "❌", msg)
 
             time.sleep(config.verify_delay)
 
-            screenshot_after = None
-            verification = {"success": True, "observation": "Dry run", "confidence": "high"}
+            # Verify
+            verification = {"success": ok, "observation": msg, "confidence": "low", "suggestion": ""}
+            screenshot_after_path = None
+            if take_screenshots and use_vision:
+                image_after, screenshot_after_path = self._take_screenshot(
+                    f"after_{action_text[:30]}_attempt{attempt_num}"
+                )
+                if ok:
+                    verification = self._verify_step(image_after, step)
 
-            if not dry_run and take_screenshots:
-                label = f"step{step_num}_att{attempt}_after"
-                after_image, screenshot_after = self._take_screenshot(label)
-
-                if use_vision:
-                    verification = self._verify_step(after_image, step)
-                    success = verification.get("success", False)
-                    obs = verification.get("observation", "")[:120]
-                    logger.info(f"{'✔ Passed' if success else '✘ Failed'}: {obs}")
-                else:
-                    verification = {"success": True, "observation": "Vision verification disabled", "confidence": "medium"}
-
-            attempts_log.append({
-                "attempt": attempt,
-                "note": note,
-                "used_fallback": used_fallback,
-                "screenshot_before": screenshot_before,
-                "screenshot_after": screenshot_after,
-                "verification": verification,
+            attempts.append({
+                "attempt_number":    attempt_num,
+                "action_plan":       action_plan,
+                "success":           verification.get("success", False),
+                "observation":       verification.get("observation", ""),
+                "suggestion":        verification.get("suggestion", ""),
+                "screenshot_before": screenshot_before_path,
+                "screenshot_after":  screenshot_after_path,
+                "used_fallback":     False,
             })
 
-            if verification.get("success", False) or dry_run:
-                final_result = {
-                    "success": True, "step_number": step_num, "action_plan": action_plan,
-                    "screenshot_before": screenshot_before, "screenshot_after": screenshot_after,
-                    "verification": verification, "notes": note, "attempts": attempts_log,
-                    "timestamp": timestamp, "dry_run": dry_run,
+            if verification.get("success", False):
+                return {
+                    "success":          True,
+                    "attempts":         attempts,
+                    "screenshot_after": screenshot_after_path,
+                    "observation":      verification.get("observation", ""),
+                    "timestamp":        datetime.now(timezone.utc).isoformat(),
                 }
-                break
 
-            if attempt > config.max_retries:
-                logger.warning(f"✘ All {config.max_retries} retries exhausted for step {step_num}")
-                final_result = {
-                    "success": False, "step_number": step_num, "action_plan": action_plan,
-                    "screenshot_before": screenshot_before, "screenshot_after": screenshot_after,
-                    "verification": verification, "notes": note, "attempts": attempts_log,
-                    "timestamp": timestamp, "dry_run": dry_run,
-                }
-                break
-
-        return final_result
-
-    def execute_all_steps(self, steps: List[dict], dry_run: bool = False, stop_on_failure: bool = False, inter_step_delay: float = 2.5) -> dict:
-        results = []
-        completed = failed = skipped = 0
-
-        print("=" * 60)
-        print(f"  Executing {len(steps)} setup step(s)")
-        if dry_run: print("  *** DRY RUN — no actual actions ***")
-        print("=" * 60)
-
-        for i, step in enumerate(steps):
-            result = self.execute_step(step, dry_run=dry_run)
-            results.append(result)
-
-            if result.get("success"):
-                completed += 1
-            else:
-                failed += 1
-                if stop_on_failure:
-                    skipped = len(steps) - (i + 1)
-                    print(f"\n  ✘ stop_on_failure=True — halting at step {step.get('step_number','?')}")
-                    break
-
-            if i < len(steps) - 1:
-                time.sleep(inter_step_delay)
-
-        overall = (failed == 0 and skipped == 0)
-        print("\n" + "=" * 60)
-        print("  Execution Complete")
-        print(f"  Total: {len(steps)} | ✔ Done: {completed} | ✘ Failed: {failed} | ⊘ Skipped: {skipped}")
-        print(f"  Overall: {'SUCCESS ✔' if overall else 'PARTIAL / FAILED ✘'}")
-        print("=" * 60)
+            if attempt_num < max_attempts:
+                suggestion = verification.get("suggestion", "")
+                if suggestion:
+                    log_step("💡", f"Suggestion for retry: {suggestion}")
+                time.sleep(1.0)
 
         return {
-            "total_steps": len(steps), "completed": completed, "failed": failed,
-            "skipped": skipped, "results": results, "overall_success": overall,
+            "success":          False,
+            "attempts":         attempts,
+            "screenshot_after": attempts[-1].get("screenshot_after"),
+            "observation":      attempts[-1].get("observation", ""),
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
         }
 
-# For backward compatibility / easy import
-_global_executor = ActionExecutor()
-def execute_step(step: dict, dry_run: bool = False, take_screenshots: bool = True, use_vision: bool = True) -> dict:
-    return _global_executor.execute_step(step, dry_run, take_screenshots, use_vision)
 
-def execute_all_steps(steps: List[dict], dry_run: bool = False, stop_on_failure: bool = False, inter_step_delay: float = 2.5) -> dict:
-    return _global_executor.execute_all_steps(steps, dry_run, stop_on_failure, inter_step_delay)
+# ── Module-level helper ────────────────────────────────────────────────────────
+
+_executor = ActionExecutor()
+
+def execute_step(
+    step: dict,
+    dry_run: bool = False,
+    take_screenshots: bool = True,
+    use_vision: bool = True,
+) -> dict:
+    return _executor.execute_step(
+        step,
+        dry_run=dry_run,
+        take_screenshots=take_screenshots,
+        use_vision=use_vision,
+    )
